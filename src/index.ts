@@ -416,7 +416,7 @@ const runBot = async () => {
 	logger.info(`Wallet pubkey: ${wallet.publicKey.toBase58()}`);
 	logger.info(` . SOL balance: ${lamportsBalance / 10 ** 9}`);
 
-	if(!config.global.skipUsdcBalance) {
+	if (!config.global.skipUsdcBalance) {
 		try {
 			const tokenAccount = await getOrCreateAssociatedTokenAccount(
 				connection,
