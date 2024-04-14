@@ -19,6 +19,7 @@ global:
   # loop purposefully runs slow so should work with public RPC
   txConfirmationEndpoint:
   txSenderType: fast
+  txSkipPreflight: true
 
   # `solana` or `helius`. If `helius` `endpoint` must be a helius RPC, or `heliusEndpoint`
   #   must be set
