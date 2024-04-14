@@ -139,6 +139,8 @@ export interface GlobalConfig {
 	txMaxRetries?: number;
 
 	rebalanceFiller?: boolean;
+
+	skipUsdcBalance?: boolean;
 }
 
 export interface Config {
@@ -192,6 +194,7 @@ const defaultConfig: Partial<Config> = {
 		disableMetrics: false,
 
 		rebalanceFiller: false,
+		skipUsdcBalance: false,
 	},
 	enabledBots: [],
 	botConfigs: {
@@ -314,6 +317,7 @@ export function loadConfigFromOpts(opts: any): Config {
 			disableMetrics: opts.disableMetrics ?? false,
 
 			rebalanceFiller: opts.rebalanceFiller ?? false,
+			skipUsdcBalance: opts.skipUsdcBalanceCheck ?? false,
 		},
 		enabledBots: [],
 		botConfigs: {},

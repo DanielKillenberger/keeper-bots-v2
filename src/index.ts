@@ -196,6 +196,7 @@ program
 	)
 	.option('--metrics-port <number>', 'Port for the Prometheus exporter', '9464')
 	.option('--disable-metrics', 'Set to disable Prometheus metrics')
+	.option('--skip-usdc-balance', 'Skip checking USDC balance')
 	.parse();
 
 const opts = program.opts();
@@ -415,16 +416,18 @@ const runBot = async () => {
 	logger.info(`Wallet pubkey: ${wallet.publicKey.toBase58()}`);
 	logger.info(` . SOL balance: ${lamportsBalance / 10 ** 9}`);
 
-	try {
-		const tokenAccount = await getOrCreateAssociatedTokenAccount(
-			connection,
-			new PublicKey(constants[config.global.driftEnv!].USDCMint),
-			wallet
-		);
-		const usdcBalance = await connection.getTokenAccountBalance(tokenAccount);
-		logger.info(` . USDC balance: ${usdcBalance.value.uiAmount}`);
-	} catch (e) {
-		logger.info(`Failed to load USDC token account: ${e}`);
+	if(!config.global.skipUsdcBalance) {
+		try {
+			const tokenAccount = await getOrCreateAssociatedTokenAccount(
+				connection,
+				new PublicKey(constants[config.global.driftEnv!].USDCMint),
+				wallet
+			);
+			const usdcBalance = await connection.getTokenAccountBalance(tokenAccount);
+			logger.info(` . USDC balance: ${usdcBalance.value.uiAmount}`);
+		} catch (e) {
+			logger.info(`Failed to load USDC token account: ${e}`);
+		}
 	}
 
 	/**
