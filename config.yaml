@@ -130,7 +130,7 @@ botConfigs:
 
     # calls simulateTransaction before sending to get an accurate CU estimate
     # as well as stop before sending the transaction (Default is true)
-    simulateTxForCUEstimate: true
+    simulateTxForCUEstimate: false
 
   spotFiller:
     botId: "spot-filler"
@@ -138,7 +138,7 @@ botConfigs:
     fillerPollingInterval: 1000
     metricsPort: 9462
     revertOnFailure: true
-    simulateTxForCUEstimate: true
+    simulateTxForCUEstimate: false
 
   liquidator:
     botId: "liquidator"
