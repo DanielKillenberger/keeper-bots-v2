@@ -100,7 +100,7 @@ enabledBots:
   - spotFiller
 
   # Trigger bot (triggers trigger orders)
-  - trigger
+  #  - trigger
 
   # Liquidator bot, liquidates unhealthy positions by taking over the risk (caution, you should manage risk here)
   # - liquidator
