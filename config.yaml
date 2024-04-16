@@ -124,7 +124,7 @@ botConfigs:
   filler:
     botId: "filler"
     dryRun: false
-    fillerPollingInterval: 1000
+    fillerPollingInterval: 6000
     metricsPort: 9463
 
     # will revert a transaction during simulation if a fill fails, this will save on tx fees,
@@ -139,7 +139,7 @@ botConfigs:
   spotFiller:
     botId: "spot-filler"
     dryRun: false
-    fillerPollingInterval: 1000
+    fillerPollingInterval: 6000
     metricsPort: 9462
     revertOnFailure: true
     simulateTxForCUEstimate: false
