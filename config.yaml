@@ -94,10 +94,10 @@ global:
 # Bot specific configs are below
 enabledBots:
   # Perp order filler bot
-  - filler
+  # - filler
 
   # Spot order filler bot
-  - spotFiller
+  # - spotFiller
 
   # Trigger bot (triggers trigger orders)
   #  - trigger
