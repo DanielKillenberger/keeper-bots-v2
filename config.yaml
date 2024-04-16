@@ -96,7 +96,11 @@ enabledBots:
   # Perp order filler bot
   - filler
 
+  # Spot order filler bot
+  - spotFiller
+
   # Trigger bot (triggers trigger orders)
+  - trigger
 
   # Liquidator bot, liquidates unhealthy positions by taking over the risk (caution, you should manage risk here)
   # - liquidator
