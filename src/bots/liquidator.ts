@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import {
 	BN,
 	convertToNumber,
@@ -15,7 +16,6 @@ import {
 	PerpMarketAccount,
 	SpotMarketAccount,
 	QUOTE_SPOT_MARKET_INDEX,
-	calculateClaimablePnl,
 	calculateMarketAvailablePNL,
 	SerumFulfillmentConfigMap,
 	initialize,
@@ -34,7 +34,6 @@ import {
 	UserAccount,
 	OptionalOrderParams,
 	TEN,
-	TxParams,
 	PriorityFeeSubscriber,
 	QuoteResponse,
 	getLimitOrderParams,
@@ -44,6 +43,8 @@ import {
 	deriveOracleAuctionParams,
 	getOrderParams,
 	OrderType,
+	getTokenValue,
+	calculateClaimablePnl,
 } from '@drift-labs/sdk';
 
 import { PrometheusExporter } from '@opentelemetry/exporter-prometheus';
@@ -64,7 +65,6 @@ import { logger } from '../logger';
 import { Bot, TwapExecutionProgress } from '../types';
 import { RuntimeSpec, metricAttrFromUserAccount } from '../metrics';
 import { webhookMessage } from '../webhook';
-import { getErrorCode } from '../error';
 import { LiquidatorConfig } from '../config';
 import {
 	getPerpMarketTierNumber,
@@ -73,9 +73,16 @@ import {
 import {
 	ComputeBudgetProgram,
 	PublicKey,
-	SimulatedTransactionResponse,
 	AddressLookupTableAccount,
+	TransactionInstruction,
 } from '@solana/web3.js';
+import { getAssociatedTokenAddress } from '@solana/spl-token';
+import {
+	calculateAccountValueUsd,
+	handleSimResultError,
+	simulateAndGetTxWithCUs,
+	SimulateAndGetTxWithCUsResponse,
+} from '../utils';
 
 const errorCodesToSuppress = [
 	6004, // Error Number: 6004. Error Message: Sufficient collateral.
@@ -127,116 +134,6 @@ function calculateSpotTokenAmountToLiquidate(
 	} else {
 		return maxSpendTokenAmountToLiquidate;
 	}
-}
-
-function findBestSpotPosition(
-	driftClient: DriftClient,
-	liquidateeUser: User,
-	liquidatorUser: User,
-	spotPositions: SpotPosition[],
-	isBorrow: boolean,
-	positionTakerOverPctNumerator: BN,
-	positionTakerOverPctDenominator: BN,
-	minDepositToLiq: Map<number, number>
-): {
-	bestIndex: number;
-	bestAmount: BN;
-	indexWithMaxAssets: number;
-	indexWithOpenOrders: number;
-} {
-	let bestIndex = -1;
-	let bestAmount = ZERO;
-	let currentAstWeight = 0;
-	let currentLibWeight = Number.MAX_VALUE;
-	let indexWithMaxAssets = -1;
-	let maxAssets = new BN(-1);
-	let indexWithOpenOrders = -1;
-
-	for (const position of spotPositions) {
-		if (position.scaledBalance.eq(ZERO)) {
-			continue;
-		}
-
-		// Skip any position that is less than the configured minimum amount
-		// for the specific market
-		const minAmount = new BN(minDepositToLiq.get(position.marketIndex) ?? 0);
-		logger.debug(
-			`findBestspotPosition: Min liquidation for market ${position.marketIndex} is ${minAmount}`
-		);
-		if (position.scaledBalance.abs().lt(minAmount)) {
-			logger.debug(
-				`findBestspotPosition: Amount ${position.scaledBalance} below ${minAmount} liquidation threshold`
-			);
-			continue;
-		}
-
-		const market = driftClient.getSpotMarketAccount(position.marketIndex);
-		if (!market) {
-			logger.error(`No spot market found for ${position.marketIndex}`);
-			continue;
-		}
-
-		if (position.openOrders > 0) {
-			indexWithOpenOrders = position.marketIndex;
-		}
-
-		const totalAssetValue = liquidateeUser.getSpotMarketAssetValue(
-			position.marketIndex,
-			'Maintenance',
-			true,
-			undefined,
-			undefined
-		);
-		if (totalAssetValue.abs().gt(maxAssets)) {
-			maxAssets = totalAssetValue.abs();
-			indexWithMaxAssets = position.marketIndex;
-		}
-
-		if (
-			(isBorrow && isVariant(position.balanceType, 'deposit')) ||
-			(!isBorrow && isVariant(position.balanceType, 'borrow'))
-		) {
-			continue;
-		}
-
-		const spotMarket = driftClient.getSpotMarketAccount(position.marketIndex);
-		if (!spotMarket) {
-			logger.error(`No spot market found for ${position.marketIndex}`);
-			continue;
-		}
-		const tokenAmount = calculateSpotTokenAmountToLiquidate(
-			driftClient,
-			liquidatorUser,
-			position,
-			positionTakerOverPctNumerator,
-			positionTakerOverPctDenominator
-		);
-
-		liquidatorUser.getSpotMarketAssetAndLiabilityValue();
-
-		if (isBorrow) {
-			if (spotMarket.maintenanceLiabilityWeight < currentLibWeight) {
-				bestAmount = tokenAmount;
-				bestIndex = position.marketIndex;
-				currentAstWeight = spotMarket.maintenanceAssetWeight;
-				currentLibWeight = spotMarket.maintenanceLiabilityWeight;
-			}
-		} else {
-			if (spotMarket.maintenanceAssetWeight > currentAstWeight) {
-				bestAmount = tokenAmount;
-				bestIndex = position.marketIndex;
-				currentAstWeight = spotMarket.maintenanceAssetWeight;
-				currentLibWeight = spotMarket.maintenanceLiabilityWeight;
-			}
-		}
-	}
-
-	return {
-		bestIndex,
-		bestAmount,
-		indexWithMaxAssets: indexWithMaxAssets,
-		indexWithOpenOrders,
-	};
 }
 
 enum METRIC_TYPES {
@@ -296,8 +193,8 @@ export class LiquidatorBot implements Bot {
 	private driftLookupTables?: AddressLookupTableAccount;
 	private driftSpotLookupTables?: AddressLookupTableAccount;
 
-	private perpMarketIndicies: number[];
-	private spotMarketIndicies: number[];
+	private perpMarketIndicies: number[] = [];
+	private spotMarketIndicies: number[] = [];
 	private activeSubAccountId: number;
 	private allSubaccounts: Set<number>;
 	private perpMarketToSubAccount: Map<number, number>;
@@ -310,7 +207,6 @@ export class LiquidatorBot implements Bot {
 	private serumFulfillmentConfigMap: SerumFulfillmentConfigMap;
 	private jupiterClient?: JupiterClient;
 	private twapExecutionProgresses?: Map<string, TwapExecutionProgress>; // key: this.getTwapProgressKey, value: TwapExecutionProgress
-	private minDepositToLiq: Map<number, number>;
 	private excludedAccounts: Set<string>;
 
 	private priorityFeeSubscriber: PriorityFeeSubscriber;
@@ -346,6 +242,15 @@ export class LiquidatorBot implements Bot {
 		this.liquidatorConfig.deriskAlgoSpot =
 			config.deriskAlgoSpot ?? config.deriskAlgo;
 
+		if (this.liquidatorConfig.spotDustValueThreshold !== undefined) {
+			this.liquidatorConfig.spotDustValueThresholdBN = new BN(
+				Math.floor(
+					this.liquidatorConfig.spotDustValueThreshold *
+						QUOTE_PRECISION.toNumber()
+				)
+			);
+		}
+
 		this.name = config.botId;
 		this.dryRun = config.dryRun;
 		this.driftClient = driftClient;
@@ -375,17 +280,14 @@ export class LiquidatorBot implements Bot {
 		this.perpMarketToSubAccount = new Map<number, number>();
 		this.spotMarketToSubAccount = new Map<number, number>();
 
-		const allPerpMarkets = this.driftClient.getPerpMarketAccounts().map((m) => {
-			return m.marketIndex;
-		});
 		if (
 			config.perpSubAccountConfig &&
-			Object.keys(config.perpSubAccountConfig).length != 0
+			Object.keys(config.perpSubAccountConfig).length > 0
 		) {
 			logger.info('Loading perp markets to watch from perpSubAccountConfig');
 			for (const subAccount of Object.keys(config.perpSubAccountConfig)) {
 				const marketsForAccount =
-					config.perpSubAccountConfig[parseInt(subAccount)] || allPerpMarkets;
+					config.perpSubAccountConfig[parseInt(subAccount)] || [];
 				for (const market of marketsForAccount) {
 					this.perpMarketToSubAccount.set(market, parseInt(subAccount));
 					this.allSubaccounts.add(parseInt(subAccount));
@@ -395,27 +297,20 @@ export class LiquidatorBot implements Bot {
 				config.perpSubAccountConfig
 			).flat();
 		} else {
-			logger.info('Loading perp markets to watch from perpMarketIndicies');
-			this.perpMarketIndicies = config.perpMarketIndicies || [];
-			if (!this.perpMarketIndicies || this.perpMarketIndicies.length === 0) {
-				this.perpMarketIndicies = allPerpMarkets;
-			}
-			for (const market of this.perpMarketIndicies) {
-				this.perpMarketToSubAccount.set(market, this.activeSubAccountId);
-			}
+			// this will be done in `init` since driftClient needs to be subcribed to first
+			logger.info(
+				`No perpSubAccountconfig provided, will watch all perp markets on subaccount ${this.activeSubAccountId}`
+			);
 		}
-		logger.info(`${this.name} perpMarketIndicies: ${this.perpMarketIndicies}`);
-		console.log('this.perpMarketToSubaccount:');
-		console.log(this.perpMarketToSubAccount);
 
-		const allSpotMarkets = this.driftClient.getSpotMarketAccounts().map((m) => {
-			return m.marketIndex;
-		});
-		if (config.spotSubAccountConfig) {
+		if (
+			config.spotSubAccountConfig &&
+			Object.keys(config.spotSubAccountConfig).length > 0
+		) {
 			logger.info('Loading spot markets to watch from spotSubAccountConfig');
 			for (const subAccount of Object.keys(config.spotSubAccountConfig)) {
 				const marketsForAccount =
-					config.spotSubAccountConfig[parseInt(subAccount)] || allSpotMarkets;
+					config.spotSubAccountConfig[parseInt(subAccount)] || [];
 				for (const market of marketsForAccount) {
 					this.spotMarketToSubAccount.set(market, parseInt(subAccount));
 					this.allSubaccounts.add(parseInt(subAccount));
@@ -425,26 +320,10 @@ export class LiquidatorBot implements Bot {
 				config.spotSubAccountConfig
 			).flat();
 		} else {
-			logger.info('Loading spot markets to watch from spotMarketIndicies');
-			this.spotMarketIndicies = config.spotMarketIndicies || [];
-			if (!this.spotMarketIndicies || this.spotMarketIndicies.length === 0) {
-				this.spotMarketIndicies = allSpotMarkets;
-			}
-			for (const market of this.spotMarketIndicies) {
-				this.spotMarketToSubAccount.set(market, this.activeSubAccountId);
-			}
-		}
-
-		logger.info(`${this.name} spotMarketIndicies: ${this.spotMarketIndicies}`);
-		console.log('this.spotMarketToSubaccount:');
-		console.log(this.spotMarketToSubAccount);
-
-		this.minDepositToLiq = new Map<number, number>();
-		if (config.minDepositToLiq != null) {
-			// We might get the keys parsed as strings
-			for (const [k, v] of Object.entries(config.minDepositToLiq)) {
-				this.minDepositToLiq.set(Number.parseInt(k), v);
-			}
+			// this will be done in `init` since driftClient needs to be subcribed to first
+			logger.info(
+				`No spotSubAccountconfig provided, will watch all spot markets on subaccount ${this.activeSubAccountId}`
+			);
 		}
 
 		// Load a list of accounts that we will *not* bother trying to liquidate
@@ -463,14 +342,6 @@ export class LiquidatorBot implements Bot {
 					);
 				});
 			}
-		}
-		logger.info(
-			`this.allSubaccounts (${this.allSubaccounts.size}): ${JSON.stringify(
-				Array.from(this.allSubaccounts)
-			)}`
-		);
-		for (const subAccountId of this.allSubaccounts) {
-			logger.info(` * ${subAccountId}`);
 		}
 
 		const nowSec = Math.floor(Date.now() / 1000);
@@ -523,7 +394,7 @@ export class LiquidatorBot implements Bot {
 		}
 		this.priorityFeeSubscriber = priorityFeeSubscriber;
 		this.priorityFeeSubscriber.updateAddresses([
-			new PublicKey('8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6'), // Openbook SOL/USDC
+			new PublicKey('6gMq3mRCKf8aP3ttTyYhuijVZ2LGi14oDsBbkgubfLB3'), // USDC SPOT
 		]);
 
 		if (!config.maxPositionTakeoverPctOfCollateral) {
@@ -531,8 +402,8 @@ export class LiquidatorBot implements Bot {
 			this.maxPositionTakeoverPctOfCollateralNum = new BN(50);
 		} else {
 			if (config.maxPositionTakeoverPctOfCollateral > 1.0) {
-				throw new Error(
-					`liquidator.config.maxPositionTakeoverPctOfCollateral cannot be > 1.00`
+				logger.warn(
+					`liquidator.config.maxPositionTakeoverPctOfCollateral is > 1.00: ${config.maxPositionTakeoverPctOfCollateral}`
 				);
 			}
 			this.maxPositionTakeoverPctOfCollateralNum = new BN(
@@ -550,6 +421,16 @@ export class LiquidatorBot implements Bot {
 		}
 		const subAccountId = this.perpMarketToSubAccount.get(marketIndex);
 		if (subAccountId === undefined) {
+			logger.info(
+				`no configured subaccount to liquidate perp market ${marketIndex}`
+			);
+			return undefined;
+		}
+
+		if (!this.hasCollateralToLiquidate(subAccountId)) {
+			logger.info(
+				`subaccount ${subAccountId} has insufficient collateral to liquidate perp market ${marketIndex}`
+			);
 			return undefined;
 		}
 		return subAccountId;
@@ -563,18 +444,78 @@ export class LiquidatorBot implements Bot {
 		}
 		const subAccountId = this.spotMarketToSubAccount.get(marketIndex);
 		if (subAccountId === undefined) {
+			logger.info(
+				`no configured subaccount to liquidate spot market ${marketIndex}`
+			);
+			return undefined;
+		}
+		if (!this.hasCollateralToLiquidate(subAccountId)) {
+			logger.info(
+				`subaccount ${subAccountId} has insufficient collateral to liquidate spot market ${marketIndex}`
+			);
 			return undefined;
 		}
 		return subAccountId;
 	}
 
-	private getTxParamsWithPriorityFees(): TxParams {
-		return {
-			computeUnits: 1_400_000,
-			computeUnitsPrice: Math.floor(
-				this.priorityFeeSubscriber.getCustomStrategyResult()
-			),
-		};
+	private getLiquidatorUserForSpotMarket(
+		marketIndex: number
+	): User | undefined {
+		const subAccountId = this.spotMarketToSubAccount.get(marketIndex);
+		if (subAccountId === undefined) {
+			return undefined;
+		}
+		return this.driftClient.getUser(subAccountId);
+	}
+
+	private async buildVersionedTransactionWithSimulatedCus(
+		ixs: Array<TransactionInstruction>,
+		luts: Array<AddressLookupTableAccount>,
+		cuPriceMicroLamports?: number
+	): Promise<SimulateAndGetTxWithCUsResponse> {
+		const fullIxs = [
+			ComputeBudgetProgram.setComputeUnitLimit({
+				units: 1_400_000, // will be overwriten in sim
+			}),
+		];
+		if (cuPriceMicroLamports !== undefined) {
+			fullIxs.push(
+				ComputeBudgetProgram.setComputeUnitPrice({
+					microLamports: cuPriceMicroLamports,
+				})
+			);
+		}
+		fullIxs.push(...ixs);
+
+		let resp: SimulateAndGetTxWithCUsResponse;
+		try {
+			resp = await simulateAndGetTxWithCUs(
+				fullIxs,
+				this.driftClient.connection,
+				this.driftClient.txSender,
+				luts,
+				[],
+				this.driftClient.opts,
+				1.2,
+				true,
+				undefined,
+				false
+			);
+		} catch (e) {
+			const err = e as Error;
+			logger.error(
+				`error in buildVersionedTransactionWithSimulatedCus, using max CUs: ${err.message}\n${err.stack}`
+			);
+			resp = {
+				cuEstimate: -1,
+				simTxLogs: null,
+				simError: err,
+				simTxDuration: -1,
+				// @ts-ignore
+				tx: undefined,
+			};
+		}
+		return resp;
 	}
 
 	private useTwap(marketType: MarketTypeStr) {
@@ -635,6 +576,47 @@ export class LiquidatorBot implements Bot {
 			}
 		}
 
+		const subAccount = this.driftClient.activeSubAccountId;
+		if (this.perpMarketIndicies.length === 0) {
+			this.perpMarketIndicies = this.driftClient
+				.getPerpMarketAccounts()
+				.map((m) => {
+					return m.marketIndex;
+				});
+
+			for (const market of this.perpMarketIndicies) {
+				this.perpMarketToSubAccount.set(market, subAccount);
+				this.allSubaccounts.add(subAccount);
+			}
+		}
+
+		if (this.spotMarketIndicies.length === 0) {
+			this.spotMarketIndicies = this.driftClient
+				.getSpotMarketAccounts()
+				.map((m) => {
+					return m.marketIndex;
+				});
+
+			for (const market of this.spotMarketIndicies) {
+				this.spotMarketToSubAccount.set(market, subAccount);
+				this.allSubaccounts.add(subAccount);
+			}
+		}
+		logger.info(
+			`SubAccountID -> perpMarketIndex:\n${JSON.stringify(
+				Object.fromEntries(this.perpMarketToSubAccount),
+				null,
+				2
+			)}`
+		);
+		logger.info(
+			`SubAccountID -> spotMarketIndex:\n${JSON.stringify(
+				Object.fromEntries(this.spotMarketToSubAccount),
+				null,
+				2
+			)}`
+		);
+
 		await webhookMessage(`[${this.name}]: started`);
 	}
 
@@ -665,17 +647,23 @@ export class LiquidatorBot implements Bot {
 
 		logger.info(`${this.name} Bot started!`);
 
-		const freeCollateral = this.driftClient.getUser().getFreeCollateral();
-		logger.info(
-			`${this.name} free collateral: $${convertToNumber(
-				freeCollateral,
-				QUOTE_PRECISION
-			)}, spending at most ${
-				(this.maxPositionTakeoverPctOfCollateralNum.toNumber() /
-					this.maxPositionTakeoverPctOfCollateralDenom.toNumber()) *
-				100.0
-			}% per liquidation`
-		);
+		for (const subAccount of this.allSubaccounts) {
+			const freeCollateral = this.driftClient
+				.getUser(subAccount)
+				.getFreeCollateral();
+			logger.info(
+				`[${
+					this.name
+				}] Subaccount: ${subAccount}:  free collateral: $${convertToNumber(
+					freeCollateral,
+					QUOTE_PRECISION
+				)}, spending at most ${
+					(this.maxPositionTakeoverPctOfCollateralNum.toNumber() /
+						this.maxPositionTakeoverPctOfCollateralDenom.toNumber()) *
+					100.0
+				}% per liquidation`
+			);
+		}
 	}
 
 	public async healthCheck(): Promise<boolean> {
@@ -747,72 +735,74 @@ export class LiquidatorBot implements Bot {
 		limitPrice: BN,
 		subAccountId: number
 	) {
-		const start = Date.now();
-		try {
-			const position = this.driftClient.getSpotPosition(marketIndex);
-			if (!position) {
-				return;
-			}
-			const positionNetOpenOrders = tokenAmount.gt(ZERO)
-				? tokenAmount.add(position.openAsks)
-				: tokenAmount.add(position.openBids);
+		const position = this.driftClient.getSpotPosition(marketIndex);
+		if (!position) {
+			return;
+		}
+		const positionNetOpenOrders = tokenAmount.gt(ZERO)
+			? tokenAmount.add(position.openAsks)
+			: tokenAmount.add(position.openBids);
 
-			const spotMarket = this.driftClient.getSpotMarketAccount(marketIndex)!;
-			const standardizedTokenAmount = standardizeBaseAssetAmount(
-				positionNetOpenOrders,
-				spotMarket.orderStepSize
+		const spotMarket = this.driftClient.getSpotMarketAccount(marketIndex)!;
+		const standardizedTokenAmount = standardizeBaseAssetAmount(
+			positionNetOpenOrders,
+			spotMarket.orderStepSize
+		);
+
+		// check if open orders already net out with current position before placing new order
+		if (standardizedTokenAmount.eq(ZERO)) {
+			logger.info(
+				`Skipping drift spot trade, would have traded 0. ${tokenAmount.toString()} -> ${positionNetOpenOrders.toString()}-> ${standardizedTokenAmount.toString()}`
 			);
+			return;
+		}
 
-			// check if open orders already net out with current position before placing new order
-			if (standardizedTokenAmount.eq(ZERO)) {
-				logger.info(
-					`Skipping drift spot trade, would have traded 0. ${tokenAmount.toString()} -> ${positionNetOpenOrders.toString()}-> ${standardizedTokenAmount.toString()}`
-				);
-				return;
-			}
+		const oracle = this.driftClient.getOracleDataForSpotMarket(marketIndex);
+		const auctionStartPrice = this.calculateDeriskAuctionStartPrice(
+			oracle,
+			orderDirection
+		);
 
-			const oracle = this.driftClient.getOracleDataForSpotMarket(marketIndex);
-			const auctionStartPrice = this.calculateDeriskAuctionStartPrice(
-				oracle,
-				orderDirection
+		const cancelOrdersIx = await this.driftClient.getCancelOrdersIx(
+			MarketType.SPOT,
+			marketIndex,
+			orderDirection,
+			subAccountId
+		);
+		const placeOrderIx = await this.driftClient.getPlaceSpotOrderIx(
+			getLimitOrderParams({
+				marketIndex: marketIndex,
+				direction: orderDirection,
+				baseAssetAmount: standardizedTokenAmount,
+				reduceOnly: true,
+				price: limitPrice,
+				auctionDuration: this.liquidatorConfig.deriskAuctionDurationSlots!,
+				auctionStartPrice,
+				auctionEndPrice: limitPrice,
+			}),
+			subAccountId
+		);
+
+		const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+			[cancelOrdersIx, placeOrderIx],
+			[this.driftLookupTables!],
+			Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+		);
+		if (simResult.simError !== null) {
+			logger.error(
+				`Error trying to close spot position for market ${marketIndex}, subaccount start ${subAccountId}, simError: ${JSON.stringify(
+					simResult.simError
+				)}`
 			);
-
-			const tx = await this.driftClient.placeSpotOrder(
-				getLimitOrderParams({
-					marketIndex: marketIndex,
-					direction: orderDirection,
-					baseAssetAmount: standardizedTokenAmount,
-					reduceOnly: true,
-					price: limitPrice,
-					auctionDuration: this.liquidatorConfig.deriskAuctionDurationSlots!,
-					auctionStartPrice,
-					auctionEndPrice: limitPrice,
-				}),
+		} else {
+			const resp = await this.driftClient.txSender.sendVersionedTransaction(
+				simResult.tx,
 				undefined,
-				subAccountId
+				this.driftClient.opts
 			);
 			logger.info(
-				`closed spot position for market ${marketIndex.toString()} on drift (subaccount ${subAccountId}): ${tx} `
+				`Sent derisk placeSpotOrder tx for on market ${marketIndex} tx: ${resp.txSig} `
 			);
-		} catch (e) {
-			logger.error(
-				`Error trying to close spot position for market ${marketIndex}, subaccount start ${subAccountId}`
-			);
-			console.error(e);
-			if (e instanceof Error) {
-				if (e.message.includes('Transaction was not confirmed in')) {
-					return;
-				}
-				webhookMessage(
-					`[${
-						this.name
-					}]: :x: error trying to close spot position on market ${marketIndex} \n:${
-						e.stack ? e.stack : e.message
-					} `
-				);
-			}
-		} finally {
-			this.recordHistogram(start, 'placeSpotOrderDrift');
 		}
 	}
 
@@ -835,70 +825,59 @@ export class LiquidatorBot implements Bot {
 			outMarketIndex = 0;
 		}
 
-		const start = Date.now();
-		try {
-			const swapIx = await this.driftClient.getJupiterSwapIxV6({
-				jupiterClient: this.jupiterClient!,
-				outMarketIndex,
-				inMarketIndex,
-				amount: new BN(quote.inAmount),
-				quote,
-				slippageBps,
-				userAccountPublicKey: await this.driftClient.getUserAccountPublicKey(
-					subAccountId
+		const swapIx = await this.driftClient.getJupiterSwapIxV6({
+			jupiterClient: this.jupiterClient!,
+			outMarketIndex,
+			inMarketIndex,
+			amount: new BN(quote.inAmount),
+			quote,
+			slippageBps,
+			userAccountPublicKey: await this.driftClient.getUserAccountPublicKey(
+				subAccountId
+			),
+		});
+		swapIx.ixs.unshift(
+			ComputeBudgetProgram.setComputeUnitPrice({
+				microLamports: Math.floor(
+					this.priorityFeeSubscriber!.getCustomStrategyResult()
 				),
-			});
-			swapIx.ixs.unshift(
-				ComputeBudgetProgram.setComputeUnitPrice({
-					microLamports: Math.floor(
-						this.priorityFeeSubscriber!.getCustomStrategyResult()
-					),
-				})
+			})
+		);
+		swapIx.ixs.unshift(
+			ComputeBudgetProgram.setComputeUnitLimit({
+				units: 1_400_000,
+			})
+		);
+		const lookupTables = [...swapIx.lookupTables, this.driftLookupTables!];
+		if (this.driftSpotLookupTables) {
+			lookupTables.push(this.driftSpotLookupTables);
+		}
+
+		const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+			swapIx.ixs,
+			lookupTables,
+			Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+		);
+		if (simResult.simError !== null) {
+			logger.error(
+				`Error trying to ${getVariant(
+					orderDirection
+				)} spot position for market ${spotMarketIndex} on jupiter, subaccount start ${subAccountId}, simError: ${JSON.stringify(
+					simResult.simError
+				)}`
 			);
-			swapIx.ixs.unshift(
-				ComputeBudgetProgram.setComputeUnitLimit({
-					units: 1_400_000,
-				})
-			);
-			const lookupTables = [...swapIx.lookupTables, this.driftLookupTables!];
-			if (this.driftSpotLookupTables) {
-				lookupTables.push(this.driftSpotLookupTables);
-			}
-			const tx = await this.driftClient.txSender.sendVersionedTransaction(
-				await this.driftClient.txSender.getVersionedTransaction(
-					swapIx.ixs,
-					lookupTables,
-					[],
-					this.driftClient.opts
-				),
-				[],
+		} else {
+			const resp = await this.driftClient.txSender.sendVersionedTransaction(
+				simResult.tx,
+				undefined,
 				this.driftClient.opts
 			);
 
 			logger.info(
-				`closed spot position for market ${spotMarketIndex.toString()} on subaccount ${subAccountId}: ${tx} `
+				`closed spot position for market ${spotMarketIndex.toString()} on subaccount ${subAccountId}: ${
+					resp.txSig
+				} `
 			);
-		} catch (e) {
-			logger.error(
-				`Error trying to ${getVariant(
-					orderDirection
-				)} spot position for market ${spotMarketIndex} on jupiter, subaccount start ${subAccountId}`
-			);
-			console.error(e);
-			if (e instanceof Error) {
-				if (e.message.includes('Transaction was not confirmed in')) {
-					return;
-				}
-				webhookMessage(
-					`[${this.name}]: :x: error trying to ${getVariant(
-						orderDirection
-					)} spot position on market on jupiter ${spotMarketIndex} \n:${
-						e.stack ? e.stack : e.message
-					} `
-				);
-			}
-		} finally {
-			this.recordHistogram(start, 'driftClientSwap');
 		}
 	}
 
@@ -1042,69 +1021,112 @@ export class LiquidatorBot implements Bot {
 				if (orderParams === undefined) {
 					continue;
 				}
-				const start = Date.now();
-				this.driftClient
-					.placePerpOrder(orderParams, undefined, userAccount.subAccountId)
-					.then((tx) => {
-						logger.info(
-							`placePerpOrder on market ${position.marketIndex.toString()}: ${tx} `
-						);
-					})
-					.catch((e) => {
-						logger.error(
-							`Error error in placePerpOrder in market: ${position.marketIndex}: ${e.message}\n${e.stack}`
-						);
-						if (!e.message.includes('Transaction was not confirmed in')) {
-							webhookMessage(
-								`[${this.name}]: :x: error in placePerpOrder\n:${
-									e.stack ? e.stack : e.message
-								} `
-							);
-						}
-					})
-					.then(() => {
-						this.recordHistogram(start, 'placePerpOrder');
-					});
+				const cancelOrdersIx = await this.driftClient.getCancelOrdersIx(
+					MarketType.PERP,
+					position.marketIndex,
+					orderParams.direction,
+					userAccount.subAccountId
+				);
+				const placeOrderIx = await this.driftClient.getPlacePerpOrderIx(
+					orderParams,
+					userAccount.subAccountId
+				);
+
+				const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+					[cancelOrdersIx, placeOrderIx],
+					[this.driftLookupTables!],
+					Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+				);
+
+				if (simResult.simError !== null) {
+					logger.error(
+						`Error error in placePerpOrder in market: ${
+							position.marketIndex
+						}, simError: ${JSON.stringify(simResult.simError)}`
+					);
+
+					const errorCode = handleSimResultError(
+						simResult,
+						errorCodesToSuppress,
+						`${this.name}: deriskPerpPositions`
+					);
+
+					if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+						const msg = `[${
+							this.name
+						}]: :x: error in placePerpOrder in market ${
+							position.marketIndex
+						}: \n${simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''}`;
+						logger.error(msg);
+						webhookMessage(msg);
+					}
+				} else {
+					const resp = await this.driftClient.txSender.sendVersionedTransaction(
+						simResult.tx,
+						undefined,
+						this.driftClient.opts
+					);
+					logger.info(
+						`Sent deriskPerpPosition tx on market ${position.marketIndex}: ${resp.txSig} `
+					);
+				}
 			} else if (position.quoteAssetAmount.lt(ZERO)) {
-				const start = Date.now();
 				const userAccountPubkey =
-					await this.driftClient.getUserAccountPublicKey();
+					await this.driftClient.getUserAccountPublicKey(
+						userAccount.subAccountId
+					);
 				logger.info(
 					`Settling negative perp pnl for ${userAccountPubkey.toBase58()} on market ${
 						position.marketIndex
 					}`
 				);
-				this.driftClient
-					.settlePNL(userAccountPubkey, userAccount, position.marketIndex)
-					.then((tx) => {
-						logger.info(
-							`settling negative perp pnl on market ${position.marketIndex.toString()}: ${tx} `
-						);
-					})
-					.catch((e) => {
-						logger.error(e);
-						logger.error(
-							`Error trying to settle negative perp pnl for market ${position.marketIndex}`
-						);
+				const ix = await this.driftClient.getSettlePNLsIxs(
+					[
+						{
+							settleeUserAccountPublicKey: userAccountPubkey,
+							settleeUserAccount: userAccount,
+						},
+					],
+					[position.marketIndex]
+				);
 
-						const errorCode = getErrorCode(e);
-						if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-							webhookMessage(
-								`[${
-									this.name
-								}]: :x: Error settlePnl in deriskPerpPosition for userAccount ${userAccountPubkey.toBase58()} on market ${
-									position.marketIndex
-								}: \n${e.logs ? (e.logs as Array<string>).join('\n') : ''} \n${
-									e.stack ? e.stack : e.message
-								} `
-							);
-						}
-					})
-					.finally(() => {
-						this.sdkCallDurationHistogram!.record(Date.now() - start, {
-							method: 'settlePNL',
-						});
-					});
+				const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+					ix,
+					[this.driftLookupTables!],
+					Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+				);
+				if (simResult.simError !== null) {
+					logger.error(
+						`Error in SettlePnl for userAccount ${userAccountPubkey.toBase58()} on market ${
+							position.marketIndex
+						}, simError: ${JSON.stringify(simResult.simError)}`
+					);
+					const errorCode = handleSimResultError(
+						simResult,
+						errorCodesToSuppress,
+						`${this.name}: settleNegativePnl`
+					);
+					if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+						webhookMessage(
+							`[${
+								this.name
+							}]: :x: error in settlePnl for userAccount ${userAccountPubkey.toBase58()} on market ${
+								position.marketIndex
+							}: \n${simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''}`
+						);
+					}
+				} else {
+					const resp = await this.driftClient.txSender.sendVersionedTransaction(
+						simResult.tx,
+						undefined,
+						this.driftClient.opts
+					);
+					logger.info(
+						`Sent settlePnl (negative pnl) tx for ${userAccountPubkey.toBase58()} on market ${
+							position.marketIndex
+						} tx: ${resp.txSig} `
+					);
+				}
 			} else if (position.quoteAssetAmount.gt(ZERO)) {
 				const availablePnl = calculateMarketAvailablePNL(
 					this.driftClient.getPerpMarketAccount(position.marketIndex)!,
@@ -1112,44 +1134,65 @@ export class LiquidatorBot implements Bot {
 				);
 
 				if (availablePnl.gt(ZERO)) {
-					const start = Date.now();
 					const userAccountPubkey =
-						await this.driftClient.getUserAccountPublicKey();
+						await this.driftClient.getUserAccountPublicKey(
+							userAccount.subAccountId
+						);
 					logger.info(
 						`Settling positive perp pnl for ${userAccountPubkey.toBase58()} on market ${
 							position.marketIndex
 						}`
 					);
-					this.driftClient
-						.settlePNL(userAccountPubkey, userAccount, position.marketIndex)
-						.then((tx) => {
-							logger.info(
-								`settling positive perp pnl on market ${position.marketIndex.toString()}: ${tx} `
+					const ix = await this.driftClient.getSettlePNLsIxs(
+						[
+							{
+								settleeUserAccountPublicKey: userAccountPubkey,
+								settleeUserAccount: userAccount,
+							},
+						],
+						[position.marketIndex]
+					);
+					const simResult =
+						await this.buildVersionedTransactionWithSimulatedCus(
+							ix,
+							[this.driftLookupTables!],
+							Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+						);
+					if (simResult.simError !== null) {
+						logger.error(
+							`Error in SettlePnl for userAccount ${userAccountPubkey.toBase58()} on market ${
+								position.marketIndex
+							}, simError: ${JSON.stringify(simResult.simError)}`
+						);
+						const errorCode = handleSimResultError(
+							simResult,
+							errorCodesToSuppress,
+							`${this.name}: settlePositivePnl`
+						);
+						if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+							const msg = `[${
+								this.name
+							}]: :x: error in settlePnl for userAccount ${userAccountPubkey.toBase58()} on market ${
+								position.marketIndex
+							}: \n${
+								simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''
+							}`;
+							logger.error(msg);
+							webhookMessage(msg);
+						}
+					} else {
+						const resp =
+							await this.driftClient.txSender.sendVersionedTransaction(
+								simResult.tx,
+								undefined,
+								this.driftClient.opts
 							);
-						})
-						.catch((e) => {
-							logger.error(e);
-							logger.error(
-								`Error trying to settle positive perp pnl for market ${position.marketIndex}`
-							);
-							const errorCode = getErrorCode(e);
-							if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-								webhookMessage(
-									`[${
-										this.name
-									}]: :x: Error settlePnl in deriskPerpPosition (2) for userAccount ${userAccountPubkey.toBase58()} on market ${
-										position.marketIndex
-									}: \n${
-										e.logs ? (e.logs as Array<string>).join('\n') : ''
-									} \n${e.stack ? e.stack : e.message} `
-								);
-							}
-						})
-						.finally(() => {
-							this.sdkCallDurationHistogram!.record(Date.now() - start, {
-								method: "'settlePNL",
-							});
-						});
+						logger.info(
+							`Sent settlePnl (positive pnl) tx for ${userAccountPubkey.toBase58()} on market ${
+								position.marketIndex
+							} tx: ${resp.txSig} `
+						);
+					}
 				}
 			}
 		}
@@ -1226,7 +1269,7 @@ export class LiquidatorBot implements Bot {
 				outputMint: outMarket.mint,
 				amount: amountIn.abs(),
 				slippageBps: slippageBps,
-				maxAccounts: 25,
+				maxAccounts: 10,
 				excludeDexes: ['Raydium CLMM'],
 			});
 		} catch (e) {
@@ -1355,6 +1398,74 @@ export class LiquidatorBot implements Bot {
 		};
 	}
 
+	private async withdrawDust(userAccount: UserAccount, position: SpotPosition) {
+		if (this.liquidatorConfig.spotDustValueThresholdBN === undefined) {
+			return;
+		}
+
+		// can only withdraw dust for now
+		if (isVariant(position.balanceType, 'borrow')) {
+			return;
+		}
+		const spotMarket = this.driftClient.getSpotMarketAccount(
+			position.marketIndex
+		);
+		if (!spotMarket) {
+			throw new Error(
+				`failed to get spot market account for market ${position.marketIndex}`
+			);
+		}
+		const oracle = this.driftClient.getOracleDataForSpotMarket(
+			position.marketIndex
+		);
+		const tokenAmount = getTokenAmount(
+			position.scaledBalance,
+			spotMarket,
+			position.balanceType
+		);
+		const spotPositionValue = getTokenValue(
+			tokenAmount,
+			spotMarket.decimals,
+			oracle
+		);
+		if (spotPositionValue.lte(this.liquidatorConfig.spotDustValueThresholdBN)) {
+			const ata = await getAssociatedTokenAddress(
+				spotMarket.mint,
+				userAccount.authority
+			);
+			const withdrawIx = await this.driftClient.getWithdrawIx(
+				tokenAmount,
+				position.marketIndex,
+				ata,
+				undefined,
+				userAccount.subAccountId
+			);
+			const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+				[withdrawIx],
+				[this.driftLookupTables!],
+				Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+			);
+			if (simResult.simError !== null) {
+				logger.error(
+					`Error trying to withdraw spot dust for market ${
+						position.marketIndex
+					}, subaccount start ${
+						userAccount.subAccountId
+					}, simError: ${JSON.stringify(simResult.simError)}`
+				);
+			} else {
+				const resp = await this.driftClient.txSender.sendVersionedTransaction(
+					simResult.tx,
+					undefined,
+					this.driftClient.opts
+				);
+				logger.info(
+					`Sent withdraw dust on market ${position.marketIndex} tx: ${resp.txSig} `
+				);
+			}
+		}
+	}
+
 	private async deriskSpotPositions(userAccount: UserAccount) {
 		for (const position of userAccount.spotPositions) {
 			if (position.scaledBalance.eq(ZERO) || position.marketIndex === 0) {
@@ -1393,12 +1504,14 @@ export class LiquidatorBot implements Bot {
 					userAccount.subAccountId
 				);
 			}
+
+			await this.withdrawDust(userAccount, position);
 		}
 	}
 
 	private async deriskForSubaccount(subaccountId: number, dlob: DLOB) {
 		this.driftClient.switchActiveUser(subaccountId, this.driftClient.authority);
-		const userAccount = this.driftClient.getUserAccount();
+		const userAccount = this.driftClient.getUserAccount(subaccountId);
 		if (!userAccount) {
 			logger.error('failed to get user account');
 			return;
@@ -1446,10 +1559,14 @@ export class LiquidatorBot implements Bot {
 		}
 	}
 
-	private calculateBaseAmountToLiquidate(
-		liquidatorUser: User,
-		liquidateePosition: PerpPosition
-	): BN {
+	private calculateBaseAmountToLiquidate(liquidateePosition: PerpPosition): BN {
+		const liquidatorUser = this.getLiquidatorUserForSpotMarket(
+			liquidateePosition.marketIndex
+		);
+		if (!liquidatorUser) {
+			return ZERO;
+		}
+
 		const oraclePrice = this.driftClient.getOracleDataForPerpMarket(
 			liquidateePosition.marketIndex
 		).price;
@@ -1546,30 +1663,49 @@ export class LiquidatorBot implements Bot {
 					}]: Resolving perp market for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx} `
 				);
 			}
-			const start = Date.now();
-			this.driftClient
-				.resolvePerpBankruptcy(userKey, userAcc, perpIdx)
-				.then((tx) => {
-					logger.info(
-						`Resolved perp bankruptcy for userAcc: ${userKey.toBase58()}, marketIndex: ${perpIdx}: ${tx} `
-					);
-				})
-				.catch((e) => {
-					logger.error(e);
-					logger.error(
-						`Error resolvePerpBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()} `
-					);
-					webhookMessage(
-						`[${
-							this.name
-						}]: :x: Error resolvePerpBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()} \n:${
-							e.stack ? e.stack : e.message
-						} `
-					);
-				})
-				.finally(() => {
-					this.recordHistogram(start, 'resolvePerpBankruptcy');
-				});
+			const ix = await this.driftClient.getResolvePerpBankruptcyIx(
+				userKey,
+				userAcc,
+				perpIdx
+			);
+			const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+				[ix],
+				[this.driftLookupTables!],
+				Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+			);
+			if (simResult.simError !== null) {
+				logger.error(
+					`Error in resolveBankruptcy for userAccount ${userKey.toBase58()} on market ${perpIdx}, simError: ${JSON.stringify(
+						simResult.simError
+					)}`
+				);
+
+				const errorCode = handleSimResultError(
+					simResult,
+					errorCodesToSuppress,
+					`${this.name}: resolveBankruptcy`
+				);
+				if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+					const msg = `[${
+						this.name
+					}]: :x: error in resolveBankruptcy for userAccount ${userKey.toBase58()}: \n${
+						simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''
+					}`;
+					logger.error(msg);
+					webhookMessage(msg);
+				}
+			} else {
+				const resp = await this.driftClient.txSender.sendVersionedTransaction(
+					simResult.tx,
+					undefined,
+					this.driftClient.opts
+				);
+				logger.info(
+					`Sent resolveBankruptcy tx for ${userKey.toBase58()} in perp market ${perpIdx} tx: ${
+						resp.txSig
+					} `
+				);
+			}
 		}
 
 		for (const spotIdx of bankruptSpotMarkets) {
@@ -1583,108 +1719,310 @@ export class LiquidatorBot implements Bot {
 					}]: Resolving spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx} `
 				);
 			}
-			const start = Date.now();
-			this.driftClient
-				.resolveSpotBankruptcy(userKey, userAcc, spotIdx)
-				.then((tx) => {
-					logger.info(
-						`Resolved spot market for userAcc: ${userKey.toBase58()}, marketIndex: ${spotIdx}: ${tx} `
-					);
-				})
-				.catch((e) => {
-					logger.error(e);
-					logger.error(
-						`Error resolveSpotpBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()} `
-					);
-					webhookMessage(
-						`[${
-							this.name
-						}]: :x: Error resolveSpotBankruptcy for ${userKey.toBase58()}, auth: ${userAcc.authority.toBase58()}: \n${
-							e.stack ? e.stack : e.message
-						} `
-					);
-				})
-				.finally(() => {
-					this.recordHistogram(start, 'resolveSpotBankruptcy');
-				});
+
+			const ix = await this.driftClient.getResolveSpotBankruptcyIx(
+				userKey,
+				userAcc,
+				spotIdx
+			);
+			const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+				[ix],
+				[this.driftLookupTables!],
+				Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+			);
+			if (simResult.simError !== null) {
+				logger.error(
+					`Error in resolveBankruptcy for userAccount ${userKey.toBase58()} in spot market ${spotIdx}, simError: ${JSON.stringify(
+						simResult.simError
+					)}`
+				);
+
+				const errorCode = handleSimResultError(
+					simResult,
+					errorCodesToSuppress,
+					`${this.name}: resolveBankruptcy`
+				);
+				if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+					const msg = `[${
+						this.name
+					}]: :x: error in resolveBankruptcy for userAccount ${userKey.toBase58()}: \n${
+						simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''
+					}`;
+					logger.error(msg);
+					webhookMessage(msg);
+				}
+			} else {
+				const resp = await this.driftClient.txSender.sendVersionedTransaction(
+					simResult.tx,
+					undefined,
+					this.driftClient.opts
+				);
+				logger.info(
+					`Sent resolveBankruptcy tx for ${userKey.toBase58()} in spot market ${spotIdx} tx: ${
+						resp.txSig
+					} `
+				);
+			}
 		}
 	}
 
+	private hasCollateralToLiquidate(subAccountId: number): boolean {
+		const currUser = this.driftClient.getUser(subAccountId);
+		const freeCollateral = currUser.getFreeCollateral('Initial');
+		const subAccountValue = new BN(
+			calculateAccountValueUsd(currUser) * QUOTE_PRECISION.toNumber()
+		);
+		const minFreeCollateral = subAccountValue
+			.mul(this.maxPositionTakeoverPctOfCollateralNum)
+			.div(this.maxPositionTakeoverPctOfCollateralDenom);
+		return freeCollateral.gte(minFreeCollateral);
+	}
+
+	private findBestSpotPosition(
+		liquidateeUser: User,
+		spotPositions: SpotPosition[],
+		isBorrow: boolean,
+		positionTakerOverPctNumerator: BN,
+		positionTakerOverPctDenominator: BN
+	): {
+		bestIndex: number;
+		bestAmount: BN;
+		indexWithMaxAssets: number;
+		indexWithOpenOrders: number;
+	} {
+		let bestIndex = -1;
+		let bestAmount = ZERO;
+		let currentAstWeight = 0;
+		let currentLibWeight = Number.MAX_VALUE;
+		let indexWithMaxAssets = -1;
+		let maxAssets = new BN(-1);
+		let indexWithOpenOrders = -1;
+
+		for (const position of spotPositions) {
+			const market = this.driftClient.getSpotMarketAccount(
+				position.marketIndex
+			);
+			if (!market) {
+				throw new Error('No spot market found, drift client misconfigured');
+				continue;
+			}
+
+			if (position.scaledBalance.eq(ZERO)) {
+				continue;
+			}
+
+			// Check for dust
+			const positionTokenAmount = getTokenAmount(
+				position.scaledBalance,
+				market,
+				position.balanceType
+			);
+			const dustThreshold = market.minOrderSize.mul(new BN(2));
+			if (positionTokenAmount.abs().lt(dustThreshold)) {
+				logger.debug(
+					`findBestSpotPosition: Amount ${position.scaledBalance} below ${dustThreshold} dust liquidation threshold`
+				);
+				continue;
+			}
+
+			if (position.openOrders > 0) {
+				indexWithOpenOrders = position.marketIndex;
+			}
+
+			const totalAssetValue = liquidateeUser.getSpotMarketAssetValue(
+				position.marketIndex,
+				'Maintenance',
+				true,
+				undefined,
+				undefined
+			);
+			if (totalAssetValue.abs().gt(maxAssets)) {
+				maxAssets = totalAssetValue.abs();
+				indexWithMaxAssets = position.marketIndex;
+			}
+
+			if (
+				(isBorrow && isVariant(position.balanceType, 'deposit')) ||
+				(!isBorrow && isVariant(position.balanceType, 'borrow'))
+			) {
+				continue;
+			}
+
+			const spotMarket = this.driftClient.getSpotMarketAccount(
+				position.marketIndex
+			);
+			if (!spotMarket) {
+				logger.error(`No spot market found for ${position.marketIndex}`);
+				continue;
+			}
+
+			const liquidatorUser = this.getLiquidatorUserForSpotMarket(
+				position.marketIndex
+			);
+			if (!liquidatorUser) {
+				continue;
+			}
+
+			const tokenAmount = calculateSpotTokenAmountToLiquidate(
+				this.driftClient,
+				liquidatorUser,
+				position,
+				positionTakerOverPctNumerator,
+				positionTakerOverPctDenominator
+			);
+
+			if (isBorrow) {
+				if (spotMarket.maintenanceLiabilityWeight < currentLibWeight) {
+					bestAmount = tokenAmount;
+					bestIndex = position.marketIndex;
+					currentAstWeight = spotMarket.maintenanceAssetWeight;
+					currentLibWeight = spotMarket.maintenanceLiabilityWeight;
+				}
+			} else {
+				if (spotMarket.maintenanceAssetWeight > currentAstWeight) {
+					bestAmount = tokenAmount;
+					bestIndex = position.marketIndex;
+					currentAstWeight = spotMarket.maintenanceAssetWeight;
+					currentLibWeight = spotMarket.maintenanceLiabilityWeight;
+				}
+			}
+		}
+
+		return {
+			bestIndex,
+			bestAmount,
+			indexWithMaxAssets: indexWithMaxAssets,
+			indexWithOpenOrders,
+		};
+	}
+
+	private async liqSpot(
+		user: User,
+		depositMarketIndexToLiq: number,
+		borrowMarketIndexToLiq: number,
+		subAccountToLiqSpot: number,
+		amountToLiqBN: BN
+	): Promise<boolean> {
+		let sentTx = false;
+		const ix = await this.driftClient.getLiquidateSpotIx(
+			user.userAccountPublicKey,
+			user.getUserAccount(),
+			depositMarketIndexToLiq,
+			borrowMarketIndexToLiq,
+			amountToLiqBN,
+			undefined,
+			subAccountToLiqSpot
+		);
+		const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+			[ix],
+			[this.driftLookupTables!],
+			Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+		);
+		if (simResult.simError !== null) {
+			logger.error(
+				`Error in liquidateSpot for userAccount ${user.userAccountPublicKey.toBase58()} in spot market ${borrowMarketIndexToLiq}, simError: ${JSON.stringify(
+					simResult.simError
+				)}`
+			);
+
+			const errorCode = handleSimResultError(
+				simResult,
+				errorCodesToSuppress,
+				`${this.name}: liquidateSpot`
+			);
+			if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+				const msg = `[${
+					this.name
+				}]: :x: error in liquidateSpot for userAccount ${user.userAccountPublicKey.toBase58()}: \n${
+					simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''
+				}`;
+				logger.error(msg);
+				webhookMessage(msg);
+			}
+		} else {
+			const resp = await this.driftClient.txSender.sendVersionedTransaction(
+				simResult.tx,
+				undefined,
+				this.driftClient.opts
+			);
+			sentTx = true;
+			logger.info(
+				`Sent liquidateSpot tx for ${user.userAccountPublicKey.toBase58()} in spot market ${borrowMarketIndexToLiq} tx: ${
+					resp.txSig
+				} `
+			);
+
+			if (this.liquidatorConfig.notifyOnLiquidation) {
+				webhookMessage(
+					`[${
+						this.name
+					}]: liquidateBorrow for userAccount ${user.userAccountPublicKey.toBase58()} in spot market ${borrowMarketIndexToLiq} tx: ${
+						resp.txSig
+					} `
+				);
+			}
+		}
+
+		return sentTx;
+	}
+
 	private async liqBorrow(
-		depositMarketIndextoLiq: number,
-		borrowMarketIndextoLiq: number,
+		depositMarketIndexToLiq: number,
+		borrowMarketIndexToLiq: number,
 		borrowAmountToLiq: BN,
 		user: User
-	) {
-		logger.debug(
-			`liqBorrow: ${user.userAccountPublicKey.toBase58()} value ${borrowAmountToLiq}`
+	): Promise<boolean> {
+		const borrowMarket = this.driftClient.getSpotMarketAccount(
+			borrowMarketIndexToLiq
+		)!;
+		const spotPrecision = TEN.pow(new BN(borrowMarket.decimals));
+		logger.info(
+			`liqBorrow: ${user.userAccountPublicKey.toBase58()} amountToLiq: ${convertToNumber(
+				borrowAmountToLiq,
+				spotPrecision
+			)} on market ${borrowMarketIndexToLiq}`
 		);
 
 		const subAccountToLiqSpot = this.getSubAccountIdToLiquidateSpot(
-			borrowMarketIndextoLiq
+			borrowMarketIndexToLiq
 		);
 		if (subAccountToLiqSpot === undefined) {
-			logger.info(
-				`skipping liquidateSpot call for ${user.userAccountPublicKey.toBase58()} because it is not in subaccounts`
-			);
-			return;
+			return false;
 		}
 
-		const start = Date.now();
-		this.driftClient
-			.liquidateSpot(
-				user.userAccountPublicKey,
-				user.getUserAccount(),
-				depositMarketIndextoLiq,
-				borrowMarketIndextoLiq,
-				borrowAmountToLiq,
-				undefined,
-				this.getTxParamsWithPriorityFees(),
-				subAccountToLiqSpot
-			)
-			.then((tx) => {
-				logger.info(
-					`liquidateSpot user = ${user.userAccountPublicKey.toString()}
-(deposit_index = ${depositMarketIndextoLiq} for borrow_index = ${borrowMarketIndextoLiq}
-								maxBorrowAmount = ${borrowAmountToLiq.toString()})
-tx: ${tx} `
-				);
-				if (this.liquidatorConfig.notifyOnLiquidation) {
-					webhookMessage(
-						`[${
-							this.name
-						}]: liquidateSpot user = ${user.userAccountPublicKey.toString()}
-	(deposit_index = ${depositMarketIndextoLiq} for borrow_index = ${borrowMarketIndextoLiq}
-									maxBorrowAmount = ${borrowAmountToLiq.toString()})
-	tx: ${tx} `
-					);
-				}
-			})
-			.catch((e) => {
-				logger.error(
-					`Error in liquidateSpot for userAccount ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq} `
-				);
-				logger.error(e);
-				const errorCode = getErrorCode(e);
+		const currUser = this.driftClient.getUser(subAccountToLiqSpot);
+		const oracle = this.driftClient.getOracleDataForSpotMarket(
+			borrowMarketIndexToLiq
+		);
+		const borrowValue = getTokenValue(
+			borrowAmountToLiq,
+			borrowMarket.decimals,
+			oracle
+		);
+		const subAccountValue = calculateAccountValueUsd(currUser);
+		const freeCollateral = currUser.getFreeCollateral('Initial');
+		const collateralAvailable = freeCollateral
+			.mul(this.maxPositionTakeoverPctOfCollateralNum)
+			.div(this.maxPositionTakeoverPctOfCollateralDenom);
 
-				if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-					webhookMessage(
-						`[${
-							this.name
-						}]: :x: Error in liquidateSpot for userAccount ${user.userAccountPublicKey.toBase58()} on market ${depositMarketIndextoLiq} for borrow index: ${borrowMarketIndextoLiq}: \n${
-							e.logs ? (e.logs as Array<string>).join('\n') : ''
-						} \n${e.stack ? e.stack : e.message} `
-					);
-				} else {
-					this.throttledUsers.set(
-						user.userAccountPublicKey.toBase58(),
-						Date.now()
-					);
-				}
-			})
-			.finally(() => {
-				this.recordHistogram(start, 'liquidateSpot');
-			});
+		let amountToLiqBN = borrowAmountToLiq.muln(2); // double to make sure it clears out extra interest
+		if (borrowValue.gt(collateralAvailable)) {
+			amountToLiqBN = spotPrecision.mul(collateralAvailable).div(oracle.price);
+		}
+		logger.info(
+			`Subaccount ${subAccountToLiqSpot}: BorrowValue: ${borrowValue}, accountValue: ${subAccountValue}, collateralAvailable: ${convertToNumber(
+				collateralAvailable,
+				QUOTE_PRECISION
+			)}, amountToLiq: ${convertToNumber(amountToLiqBN, spotPrecision)}`
+		);
+
+		return await this.liqSpot(
+			user,
+			depositMarketIndexToLiq,
+			borrowMarketIndexToLiq,
+			subAccountToLiqSpot,
+			amountToLiqBN
+		);
 	}
 
 	private async liqPerpPnl(
@@ -1696,12 +2034,13 @@ tx: ${tx} `
 		depositAmountToLiq: BN,
 		borrowMarketIndextoLiq: number,
 		borrowAmountToLiq: BN
-	) {
+	): Promise<boolean> {
 		logger.info(
 			`liqPerpPnl: ${user.userAccountPublicKey.toBase58()} depositAmountToLiq: ${depositAmountToLiq.toString()} (depMktIndex: ${depositMarketIndextoLiq}). borrowAmountToLiq: ${borrowAmountToLiq.toString()} (brwMktIndex: ${borrowMarketIndextoLiq}). liqeePositionQuoteAmount: ${liquidateePosition.quoteAssetAmount.toNumber()} (perpMktIdx: ${
 				perpMarketAccount.marketIndex
 			})`
 		);
+		let sentTx = false;
 
 		if (liquidateePosition.quoteAssetAmount.gt(ZERO)) {
 			const claimablePnl = calculateClaimablePnl(
@@ -1714,40 +2053,55 @@ tx: ${tx} `
 			);
 
 			if (claimablePnl.gt(ZERO) && borrowMarketIndextoLiq === -1) {
-				this.driftClient
-					.settlePNL(
-						user.userAccountPublicKey,
-						user.getUserAccount(),
-						liquidateePosition.marketIndex
-					)
-					.then((tx) => {
-						logger.info(
-							`settled positive pnl for ${user.userAccountPublicKey.toBase58()} for market ${
-								liquidateePosition.marketIndex
-							}: ${tx} `
-						);
-					})
-					.catch((e) => {
-						logger.error(
-							`Error settling positive pnl for ${user.userAccountPublicKey.toBase58()} for market ${
-								liquidateePosition.marketIndex
-							}\n${e.stack ? e.stack : e.message}`
-						);
+				const ix = await this.driftClient.getSettlePNLsIxs(
+					[
+						{
+							settleeUserAccountPublicKey: user.userAccountPublicKey,
+							settleeUserAccount: user.getUserAccount(),
+						},
+					],
+					[liquidateePosition.marketIndex]
+				);
+				const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+					ix,
+					[this.driftLookupTables!],
+					Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+				);
+				if (simResult.simError !== null) {
+					logger.error(
+						`Error in settlePnl for userAccount ${user.userAccountPublicKey.toBase58()} in perp market ${
+							liquidateePosition.marketIndex
+						}, simError: ${JSON.stringify(simResult.simError)}`
+					);
 
-						const errorCode = getErrorCode(e);
-						if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-							webhookMessage(
-								`[${
-									this.name
-								}]: :x: Error settlePnl in liqPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
-									liquidateePosition.marketIndex
-								}: \n${e.logs ? (e.logs as Array<string>).join('\n') : ''} \n${
-									e.stack ? e.stack : e.message
-								} `
-							);
-						}
-					});
-				return;
+					const errorCode = handleSimResultError(
+						simResult,
+						errorCodesToSuppress,
+						`${this.name}: settlePnl`
+					);
+					if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+						const msg = `[${
+							this.name
+						}]: :x: error in settlePnl for userAccount ${user.userAccountPublicKey.toBase58()}: \n${
+							simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''
+						}`;
+						logger.error(msg);
+						webhookMessage(msg);
+					}
+				} else {
+					const resp = await this.driftClient.txSender.sendVersionedTransaction(
+						simResult.tx,
+						undefined,
+						this.driftClient.opts
+					);
+					logger.info(
+						`Sent settlePnl tx for ${user.userAccountPublicKey.toBase58()} in perp market ${
+							liquidateePosition.marketIndex
+						} tx: ${resp.txSig} `
+					);
+				}
+
+				return sentTx;
 			}
 
 			let frac = new BN(100000000);
@@ -1763,68 +2117,66 @@ tx: ${tx} `
 					borrowMarketIndextoLiq
 				);
 				if (subAccountToLiqBorrow === undefined) {
-					logger.info(
-						`skipping liquidateBorrowForPerpPnl of ${user.userAccountPublicKey.toBase58()} on market ${borrowMarketIndextoLiq}`
-					);
-					return;
+					return sentTx;
 				}
 
-				const start = Date.now();
-				this.driftClient
-					.liquidateBorrowForPerpPnl(
-						user.userAccountPublicKey,
-						user.getUserAccount(),
-						liquidateePosition.marketIndex,
-						borrowMarketIndextoLiq,
-						borrowAmountToLiq.div(frac),
+				const ix = await this.driftClient.getLiquidateBorrowForPerpPnlIx(
+					user.userAccountPublicKey,
+					user.getUserAccount(),
+					liquidateePosition.marketIndex,
+					borrowMarketIndextoLiq,
+					borrowAmountToLiq.div(frac),
+					undefined,
+					subAccountToLiqBorrow
+				);
+				const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+					[ix],
+					[this.driftLookupTables!],
+					Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+				);
+				if (simResult.simError !== null) {
+					logger.error(
+						`Error in liquidateBorrowForPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()} in spot market ${borrowMarketIndextoLiq}, simError: ${JSON.stringify(
+							simResult.simError
+						)}`
+					);
+
+					const errorCode = handleSimResultError(
+						simResult,
+						errorCodesToSuppress,
+						`${this.name}: liquidateBorrowForPerpPnl`
+					);
+					if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+						const msg = `[${
+							this.name
+						}]: :x: error in liquidateBorrowForPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()}: \n${
+							simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''
+						}`;
+						logger.error(msg);
+						webhookMessage(msg);
+					}
+				} else {
+					const resp = await this.driftClient.txSender.sendVersionedTransaction(
+						simResult.tx,
 						undefined,
-						this.getTxParamsWithPriorityFees(),
-						subAccountToLiqBorrow
-					)
-					.then((tx) => {
-						logger.info(
-							`liquidateBorrowForPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
-								liquidateePosition.marketIndex
-							} tx: ${tx} `
-						);
-						if (this.liquidatorConfig.notifyOnLiquidation) {
-							webhookMessage(
-								`[${
-									this.name
-								}]: liquidateBorrowForPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
-									liquidateePosition.marketIndex
-								} tx: ${tx} `
-							);
-						}
-					})
-					.catch((e) => {
-						logger.error(
-							`Error in liquidateBorrowForPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
-								liquidateePosition.marketIndex
+						this.driftClient.opts
+					);
+					logger.info(
+						`Sent liquidateBorrowForPerpPnl tx for ${user.userAccountPublicKey.toBase58()} in spot market ${borrowMarketIndextoLiq} tx: ${
+							resp.txSig
+						} `
+					);
+
+					if (this.liquidatorConfig.notifyOnLiquidation) {
+						webhookMessage(
+							`[${
+								this.name
+							}]: liquidateBorrowForPerpPnl for userAccount ${user.userAccountPublicKey.toBase58()} in spot market ${borrowMarketIndextoLiq} tx: ${
+								resp.txSig
 							} `
 						);
-						logger.error(e);
-						const errorCode = getErrorCode(e);
-						if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-							webhookMessage(
-								`[${
-									this.name
-								}]: :x: error in liquidateBorrowForPerpPnl for ${user.userAccountPublicKey.toBase58()} on market ${
-									liquidateePosition.marketIndex
-								}: \n${e.logs ? (e.logs as Array<string>).join('\n') : ''} \n${
-									e.stack ? e.stack : e.message
-								} `
-							);
-						} else {
-							this.throttledUsers.set(
-								user.userAccountPublicKey.toBase58(),
-								Date.now()
-							);
-						}
-					})
-					.finally(() => {
-						this.recordHistogram(start, 'liquidateBorrowForPerpPnl');
-					});
+					}
+				}
 			} else {
 				logger.info(
 					`claimablePnl = ${claimablePnl.toString()} << liquidateePosition.quoteAssetAmount=${liquidateePosition.quoteAssetAmount.toString()} `
@@ -1838,55 +2190,88 @@ tx: ${tx} `
 				user.getSafestTiers();
 			const perpTier = getPerpMarketTierNumber(perpMarketAccount);
 			if (!perpTierIsAsSafeAs(perpTier, safestPerpTier, safestSpotTier)) {
-				logger.info(
-					`skipping liquidatePerpPnlForDeposit of ${user.userAccountPublicKey.toBase58()} on spot market ${depositMarketIndextoLiq} because there is a safer perp/spot tier. perp tier ${perpTier} safestPerpTier ${safestPerpTier} safestSpotTier ${safestSpotTier}`
-				);
-				return;
+				return sentTx;
 			}
 
 			if (!this.spotMarketIndicies.includes(depositMarketIndextoLiq)) {
 				logger.info(
 					`skipping liquidatePerpPnlForDeposit of ${user.userAccountPublicKey.toBase58()} on spot market ${depositMarketIndextoLiq} because it is not in spotMarketIndices`
 				);
-				return;
+				return sentTx;
 			}
 
 			const subAccountToTakeOverPerpPnl = this.getSubAccountIdToLiquidatePerp(
 				liquidateePosition.marketIndex
 			);
 			if (subAccountToTakeOverPerpPnl === undefined) {
-				logger.info(
-					`skipping over liquidatePerpPnlForDeposit of ${user.userAccountPublicKey.toBase58()} on perp market ${
-						liquidateePosition.marketIndex
-					}`
-				);
-				return;
+				return sentTx;
 			}
 
+			const pnlToLiq = this.driftClient
+				.getUser(subAccountToTakeOverPerpPnl)
+				.getFreeCollateral('Initial');
 			try {
-				const tx = await this.driftClient.liquidatePerpPnlForDeposit(
+				const ix = await this.driftClient.getLiquidatePerpPnlForDepositIx(
 					user.userAccountPublicKey,
 					user.getUserAccount(),
 					liquidateePosition.marketIndex,
 					depositMarketIndextoLiq,
-					depositAmountToLiq,
+					pnlToLiq,
 					undefined,
-					this.getTxParamsWithPriorityFees(),
 					subAccountToTakeOverPerpPnl
 				);
-				logger.info(
-					`did liquidatePerpPnlForDeposit for ${user.userAccountPublicKey.toBase58()} on market ${
-						liquidateePosition.marketIndex
-					} tx: ${tx} `
+				const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+					[ix],
+					[this.driftLookupTables!],
+					Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
 				);
-				if (this.liquidatorConfig.notifyOnLiquidation) {
-					webhookMessage(
-						`[${
-							this.name
-						}]: liquidatePerpPnlForDeposit for ${user.userAccountPublicKey.toBase58()} on market ${
+
+				if (simResult.simError !== null) {
+					logger.error(
+						`Error in liquidatePerpPnlForDeposit for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
 							liquidateePosition.marketIndex
-						} tx: ${tx} `
+						}: simError: ${JSON.stringify(simResult.simError)}`
 					);
+					const errorCode = handleSimResultError(
+						simResult,
+						errorCodesToSuppress,
+						`${this.name}: liquidatePerpPnlForDeposit`
+					);
+					if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+						const msg = `[${
+							this.name
+						}]: :x: error in liquidatePerpPnlForDeposit for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
+							liquidateePosition.marketIndex
+						}: \n${simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''}`;
+						logger.error(msg);
+						webhookMessage(msg);
+					} else {
+						this.throttledUsers.set(
+							user.userAccountPublicKey.toBase58(),
+							Date.now()
+						);
+					}
+				} else {
+					const resp = await this.driftClient.txSender.sendVersionedTransaction(
+						simResult.tx,
+						undefined,
+						this.driftClient.opts
+					);
+					sentTx = true;
+					logger.info(
+						`Sent liquidatePerpPnlForDeposit tx for ${user.userAccountPublicKey.toBase58()} on market ${
+							liquidateePosition.marketIndex
+						} tx: ${resp.txSig} `
+					);
+					if (this.liquidatorConfig.notifyOnLiquidation) {
+						webhookMessage(
+							`[${
+								this.name
+							}]: liquidatePerpPnlForDeposit for ${user.userAccountPublicKey.toBase58()} on market ${
+								liquidateePosition.marketIndex
+							} tx: ${resp.txSig} `
+						);
+					}
 				}
 			} catch (err) {
 				logger.error(
@@ -1895,29 +2280,82 @@ tx: ${tx} `
 					}`
 				);
 				console.error(err);
-				const e = err as Error;
-				const errorCode = getErrorCode(e);
-				if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-					const simError = err as SimulatedTransactionResponse;
-					webhookMessage(
-						`[${
-							this.name
-						}]: :x: error in liquidatePerpPnlForDeposit for userAccount ${user.userAccountPublicKey.toBase58()} on market ${
-							liquidateePosition.marketIndex
-						}: \n${
-							simError.logs ? (simError.logs as Array<string>).join('\n') : ''
-						} \n${e.stack ? e.stack : e.message} `
-					);
-				} else {
-					this.throttledUsers.set(
-						user.userAccountPublicKey.toBase58(),
-						Date.now()
-					);
-				}
 			} finally {
 				this.recordHistogram(start, 'liquidatePerpPnlForDeposit');
 			}
 		}
+
+		return sentTx;
+	}
+
+	private async liqPerp(
+		user: User,
+		perpMarketIndex: number,
+		subAccountToLiqPerp: number,
+		baseAmountToLiquidate: BN
+	): Promise<boolean> {
+		let txSent = false;
+		const ix = await this.driftClient.getLiquidatePerpIx(
+			user.userAccountPublicKey,
+			user.getUserAccount(),
+			perpMarketIndex,
+			baseAmountToLiquidate,
+			undefined,
+			subAccountToLiqPerp
+		);
+		const simResult = await this.buildVersionedTransactionWithSimulatedCus(
+			[ix],
+			[this.driftLookupTables!],
+			Math.floor(this.priorityFeeSubscriber.getCustomStrategyResult())
+		);
+		if (simResult.simError !== null) {
+			logger.error(
+				`Error in liquidatePerp for userAccount ${user.userAccountPublicKey.toBase58()} on market ${perpMarketIndex}, simError: ${JSON.stringify(
+					simResult.simError
+				)}`
+			);
+			const errorCode = handleSimResultError(
+				simResult,
+				errorCodesToSuppress,
+				`${this.name}: liquidatePerp`
+			);
+			if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
+				const msg = `[${
+					this.name
+				}]: :x: error in liquidatePerp for userAccount ${user.userAccountPublicKey.toBase58()} on market ${perpMarketIndex}: \n${
+					simResult.simTxLogs ? simResult.simTxLogs.join('\n') : ''
+				}`;
+				logger.error(msg);
+				webhookMessage(msg);
+			} else {
+				this.throttledUsers.set(
+					user.userAccountPublicKey.toBase58(),
+					Date.now()
+				);
+			}
+		} else {
+			const resp = await this.driftClient.txSender.sendVersionedTransaction(
+				simResult.tx,
+				undefined,
+				this.driftClient.opts
+			);
+			txSent = true;
+			logger.info(
+				`Sent liquidatePerp tx for ${user.userAccountPublicKey.toBase58()} on market ${perpMarketIndex} tx: ${
+					resp.txSig
+				} `
+			);
+			if (this.liquidatorConfig.notifyOnLiquidation) {
+				webhookMessage(
+					`[${
+						this.name
+					}]: liquidatePerp for ${user.userAccountPublicKey.toBase58()} on market ${perpMarketIndex} tx: ${
+						resp.txSig
+					} `
+				);
+			}
+		}
+		return txSent;
 	}
 
 	private findSortedUsers(): {
@@ -1977,14 +2415,29 @@ tx: ${tx} `
 		checkedUsers: number;
 		liquidatableUsers: number;
 		ran: boolean;
+		skipReason: {
+			untrackedPerpMarket: number;
+			untrackedSpotMarket: number;
+			throttledUser: number;
+			liquidatePerpPnlForDepositSent: number;
+			liquidatePerpSent: number;
+			liquidateSpotSent: number;
+		};
 	}> {
 		const { usersCanBeLiquidated, checkedUsers, liquidatableUsers } =
 			this.findSortedUsers();
 
+		let untrackedPerpMarket = 0;
+		let untrackedSpotMarket = 0;
+		let throttledUser = 0;
+		let liquidatePerpPnlForDepositSent = 0;
+		let liquidatePerpSent = 0;
+		let liquidateSpotSent = 0;
+
 		for (const {
 			user,
 			userKey,
-			marginRequirement,
+			marginRequirement: _marginRequirement,
 			canBeLiquidated,
 		} of usersCanBeLiquidated) {
 			const userAcc = user.getUserAccount();
@@ -2002,20 +2455,13 @@ tx: ${tx} `
 								lastAttempt + LIQUIDATE_THROTTLE_BACKOFF - now
 							}ms) ${auth}: ${userKey} `
 						);
+						throttledUser++;
 						continue;
 					} else {
 						this.throttledUsers.delete(userKey);
 					}
 				}
 
-				logger.info(`liquidating auth: ${auth}, userAccount: ${userKey}...`);
-				if (this.liquidatorConfig.notifyOnLiquidation) {
-					webhookMessage(
-						`[${this.name}]: liquidating auth: ${auth}: userAccount: ${userKey} ...`
-					);
-				}
-
-				const liquidatorUser = this.driftClient.getUser();
 				const liquidateeUserAccount = user.getUserAccount();
 
 				// most attractive spot market liq
@@ -2024,62 +2470,61 @@ tx: ${tx} `
 					bestAmount: depositAmountToLiq,
 					indexWithMaxAssets,
 					indexWithOpenOrders,
-				} = findBestSpotPosition(
-					this.driftClient,
+				} = this.findBestSpotPosition(
 					user,
-					liquidatorUser,
 					liquidateeUserAccount.spotPositions,
 					false,
 					this.maxPositionTakeoverPctOfCollateralNum,
-					this.maxPositionTakeoverPctOfCollateralDenom,
-					this.minDepositToLiq
+					this.maxPositionTakeoverPctOfCollateralDenom
 				);
 
 				const {
 					bestIndex: borrowMarketIndextoLiq,
 					bestAmount: borrowAmountToLiq,
-				} = findBestSpotPosition(
-					this.driftClient,
+				} = this.findBestSpotPosition(
 					user,
-					liquidatorUser,
 					liquidateeUserAccount.spotPositions,
 					true,
 					this.maxPositionTakeoverPctOfCollateralNum,
-					this.maxPositionTakeoverPctOfCollateralDenom,
-					this.minDepositToLiq
+					this.maxPositionTakeoverPctOfCollateralDenom
 				);
 
 				let liquidateeHasSpotPos = false;
 				if (borrowMarketIndextoLiq != -1 && depositMarketIndextoLiq != -1) {
 					liquidateeHasSpotPos = true;
-					logger.info(
-						`User ${userKey} has spot positions to liquidate ${canBeLiquidated}, marginRequirement: ${marginRequirement}`
-					);
-					await this.liqBorrow(
+					const sent = await this.liqBorrow(
 						depositMarketIndextoLiq,
 						borrowMarketIndextoLiq,
 						borrowAmountToLiq,
 						user
 					);
+					if (sent) {
+						liquidateSpotSent++;
+					}
 				}
 
 				const usdcMarket = this.driftClient.getSpotMarketAccount(
 					QUOTE_SPOT_MARKET_INDEX
 				);
 				if (!usdcMarket) {
-					logger.error(`no usdcMarket for ${QUOTE_SPOT_MARKET_INDEX}`);
-					continue;
+					throw new Error(
+						`USDC spot market not loaded, misconfigured DriftClient`
+					);
 				}
 
 				// less attractive, perp / perp pnl liquidations
 				let liquidateeHasPerpPos = false;
 				let liquidateeHasUnsettledPerpPnl = false;
 				let liquidateeHasLpPos = false;
-				let liquidateePerpHasOpenOrders = false;
 				let liquidateePerpIndexWithOpenOrders = -1;
-				for (const liquidateePosition of user.getActivePerpPositions()) {
+
+				// shuffle user perp positions to get good position coverage in case some
+				// positions put the liquidator into a bad state.
+				const userPerpPositions = user.getActivePerpPositions();
+				userPerpPositions.sort(() => Math.random() - 0.5);
+
+				for (const liquidateePosition of userPerpPositions) {
 					if (liquidateePosition.openOrders > 0) {
-						liquidateePerpHasOpenOrders = true;
 						liquidateePerpIndexWithOpenOrders = liquidateePosition.marketIndex;
 					}
 
@@ -2091,17 +2536,23 @@ tx: ${tx} `
 						!liquidateePosition.quoteAssetAmount.isZero();
 					liquidateeHasLpPos = !liquidateePosition.lpShares.isZero();
 
-					if (liquidateeHasUnsettledPerpPnl) {
+					const tryLiqPerp =
+						liquidateeHasUnsettledPerpPnl &&
+						// call liquidatePerpPnlForDeposit
+						((liquidateePosition.quoteAssetAmount.lt(ZERO) &&
+							depositMarketIndextoLiq > 0) ||
+							// call liquidateBorrowForPerpPnl or settlePnl
+							liquidateePosition.quoteAssetAmount.gt(ZERO));
+					if (tryLiqPerp) {
 						const perpMarket = this.driftClient.getPerpMarketAccount(
 							liquidateePosition.marketIndex
 						);
 						if (!perpMarket) {
-							logger.error(
-								`no perpMarket for ${liquidateePosition.marketIndex}`
+							throw new Error(
+								`perpMarket not loaded for marketIndex ${liquidateePosition.marketIndex}, misconfigured DriftClient`
 							);
-							continue;
 						}
-						await this.liqPerpPnl(
+						const sent = await this.liqPerpPnl(
 							user,
 							perpMarket,
 							usdcMarket,
@@ -2111,10 +2562,12 @@ tx: ${tx} `
 							borrowMarketIndextoLiq,
 							borrowAmountToLiq
 						);
+						if (sent) {
+							liquidatePerpPnlForDepositSent++;
+						}
 					}
 
 					const baseAmountToLiquidate = this.calculateBaseAmountToLiquidate(
-						liquidatorUser,
 						user.getPerpPositionWithLPSettle(
 							liquidateePosition.marketIndex,
 							liquidateePosition
@@ -2125,9 +2578,7 @@ tx: ${tx} `
 						liquidateePosition.marketIndex
 					);
 					if (subAccountToLiqPerp === undefined) {
-						logger.info(
-							`skipping liquidatePerp call for ${user.userAccountPublicKey.toBase58()} because it is not in subaccounts`
-						);
+						untrackedPerpMarket++;
 						continue;
 					}
 
@@ -2137,90 +2588,30 @@ tx: ${tx} `
 							continue;
 						}
 
-						const start = Date.now();
-						this.driftClient
-							.liquidatePerp(
-								user.userAccountPublicKey,
-								user.getUserAccount(),
-								liquidateePosition.marketIndex,
-								baseAmountToLiquidate,
-								undefined,
-								this.getTxParamsWithPriorityFees(),
-								subAccountToLiqPerp
-							)
-							.then((tx) => {
-								logger.info(`liquidatePerp tx: ${tx} `);
-								if (this.liquidatorConfig.notifyOnLiquidation) {
-									webhookMessage(
-										`[${
-											this.name
-										}]: liquidatePerp for ${user.userAccountPublicKey.toBase58()} on market ${
-											liquidateePosition.marketIndex
-										} tx: ${tx} `
-									);
-								}
-							})
-							.catch((e) => {
-								logger.error(
-									`Error liquidating auth: ${auth}, user: ${userKey} on market ${liquidateePosition.marketIndex} `
-								);
-								console.error(e);
-
-								const errorCode = getErrorCode(e);
-								if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-									webhookMessage(
-										`[${
-											this.name
-										}]: :x: Error liquidatePerp'ing auth: ${auth}, user: ${userKey} on market ${
-											liquidateePosition.marketIndex
-										} \n${
-											e.logs ? (e.logs as Array<string>).join('\n') : ''
-										} \n${e.stack || e} `
-									);
-								}
-							})
-							.finally(() => {
-								this.recordHistogram(start, 'liquidatePerp');
-							});
+						const sent = await this.liqPerp(
+							user,
+							liquidateePosition.marketIndex,
+							subAccountToLiqPerp,
+							baseAmountToLiquidate
+						);
+						if (sent) {
+							liquidatePerpSent++;
+						}
 					} else if (liquidateeHasLpPos) {
 						logger.info(
 							`liquidatePerp ${auth}-${user.userAccountPublicKey.toBase58()} on market ${
 								liquidateePosition.marketIndex
 							} has lp shares but no perp pos, trying to clear it:`
 						);
-
-						this.driftClient
-							.liquidatePerp(
-								user.userAccountPublicKey,
-								user.getUserAccount(),
-								liquidateePosition.marketIndex,
-								ZERO,
-								undefined,
-								this.getTxParamsWithPriorityFees(),
-								subAccountToLiqPerp
-							)
-							.then((tx) => {
-								logger.info(
-									`liquidatePerp (no perp pos) ${auth}-${user.userAccountPublicKey.toBase58()} tx: ${tx} `
-								);
-							})
-							.catch((e) => {
-								logger.error(
-									`Error liquidating auth: ${auth}, user: ${userKey} on market ${liquidateePosition.marketIndex}\n${e}`
-								);
-								const errorCode = getErrorCode(e);
-								if (errorCode && !errorCodesToSuppress.includes(errorCode)) {
-									webhookMessage(
-										`[${
-											this.name
-										}]: :x: Error liquidatePerp'ing auth (with no pos, but has lp shares): ${auth}, user: ${userKey} on market ${
-											liquidateePosition.marketIndex
-										} \n${
-											e.logs ? (e.logs as Array<string>).join('\n') : ''
-										} \n${e.stack || e} `
-									);
-								}
-							});
+						const sent = await this.liqPerp(
+							user,
+							liquidateePosition.marketIndex,
+							subAccountToLiqPerp,
+							ZERO
+						);
+						if (sent) {
+							liquidatePerpSent++;
+						}
 					}
 				}
 
@@ -2228,7 +2619,7 @@ tx: ${tx} `
 					logger.info(
 						`${auth}-${user.userAccountPublicKey.toBase58()} can be liquidated but has no positions`
 					);
-					if (liquidateePerpHasOpenOrders) {
+					if (liquidateePerpIndexWithOpenOrders !== -1) {
 						logger.info(
 							`${auth}-${user.userAccountPublicKey.toBase58()} liquidatePerp with open orders in ${liquidateePerpIndexWithOpenOrders}`
 						);
@@ -2241,32 +2632,19 @@ tx: ${tx} `
 							liquidateePerpIndexWithOpenOrders
 						);
 						if (subAccountToLiqPerp === undefined) {
-							logger.info(
-								`skipping liquidatePerp call for ${user.userAccountPublicKey.toBase58()} on market with only open orders (${liquidateePerpIndexWithOpenOrders}) because it is not in subaccounts`
-							);
+							untrackedPerpMarket++;
 							continue;
 						}
 
-						this.driftClient
-							.liquidatePerp(
-								user.userAccountPublicKey,
-								user.getUserAccount(),
-								liquidateePerpIndexWithOpenOrders,
-								ZERO,
-								undefined,
-								this.getTxParamsWithPriorityFees(),
-								subAccountToLiqPerp
-							)
-							.then((tx) => {
-								logger.info(
-									`liquidatePerp (no pos) ${auth}-${user.userAccountPublicKey.toBase58()} tx: ${tx} `
-								);
-							})
-							.catch((e) => {
-								logger.error(
-									`Error in liquidatePerp, liquidating auth: ${auth}, user: ${userKey} on market ${liquidateePerpIndexWithOpenOrders}\n${e}`
-								);
-							});
+						const sent = await this.liqPerp(
+							user,
+							liquidateePerpIndexWithOpenOrders,
+							subAccountToLiqPerp,
+							ZERO
+						);
+						if (sent) {
+							liquidatePerpSent++;
+						}
 					}
 					if (indexWithOpenOrders !== -1) {
 						logger.info(
@@ -2276,35 +2654,23 @@ tx: ${tx} `
 							user.userAccountPublicKey.toBase58(),
 							Date.now()
 						);
+
 						const subAccountToLiqSpot =
 							this.getSubAccountIdToLiquidateSpot(indexWithOpenOrders);
 						if (subAccountToLiqSpot === undefined) {
-							logger.info(
-								`skipping liquidateSpot call for ${user.userAccountPublicKey.toBase58()} on market with open orders ${indexWithOpenOrders}`
-							);
-							break;
+							untrackedSpotMarket++;
+							continue;
 						}
-						this.driftClient
-							.liquidateSpot(
-								user.userAccountPublicKey,
-								user.getUserAccount(),
-								indexWithMaxAssets,
-								indexWithOpenOrders,
-								ZERO,
-								undefined,
-								this.getTxParamsWithPriorityFees(),
-								subAccountToLiqSpot
-							)
-							.then((tx) => {
-								logger.info(
-									`liquidateSpot (no pos) ${auth}-${user.userAccountPublicKey.toBase58()} tx: ${tx} `
-								);
-							})
-							.catch((e) => {
-								logger.error(
-									`Error in liquidateSpot, liquidating auth: ${auth}, user: ${userKey} on market ${indexWithMaxAssets}\n${e}`
-								);
-							});
+						const sent = await this.liqSpot(
+							user,
+							indexWithMaxAssets,
+							indexWithOpenOrders,
+							subAccountToLiqSpot,
+							ZERO
+						);
+						if (sent) {
+							liquidateSpotSent++;
+						}
 					}
 				}
 			} else if (user.isBeingLiquidated()) {
@@ -2317,29 +2683,29 @@ tx: ${tx} `
 				);
 
 				// can liquidate with any subaccount, no liability transfer
-				this.driftClient
-					.liquidatePerp(
-						user.userAccountPublicKey,
-						user.getUserAccount(),
-						0,
-						ZERO,
-						undefined,
-						this.getTxParamsWithPriorityFees()
-					)
-					.then((tx) => {
-						logger.info(
-							`liquidatePerp for stuck(beingLiquidated) user tx: ${tx} `
-						);
-					})
-					.catch((e) => {
-						console.error(e);
-					});
+				const sent = await this.liqPerp(
+					user,
+					0,
+					this.driftClient.activeSubAccountId,
+					ZERO
+				);
+				if (sent) {
+					liquidatePerpSent++;
+				}
 			}
 		}
 		return {
 			ran: true,
 			checkedUsers,
 			liquidatableUsers,
+			skipReason: {
+				untrackedPerpMarket,
+				untrackedSpotMarket,
+				throttledUser,
+				liquidatePerpPnlForDepositSent,
+				liquidatePerpSent,
+				liquidateSpotSent,
+			},
 		};
 	}
 
@@ -2367,8 +2733,10 @@ tx: ${tx} `
 		let ran = false;
 		let checkedUsers = 0;
 		let liquidatableUsers = 0;
+		let skipReason: any;
 		try {
-			({ ran, checkedUsers, liquidatableUsers } = await this.tryLiquidate());
+			({ ran, checkedUsers, liquidatableUsers, skipReason } =
+				await this.tryLiquidate());
 		} catch (e) {
 			console.error(e);
 			if (e instanceof Error) {
@@ -2380,12 +2748,12 @@ tx: ${tx} `
 			}
 		} finally {
 			if (ran) {
-				logger.debug(
+				logger.info(
 					`${
 						this.name
-					} Bot checked ${checkedUsers} users, ${liquidatableUsers} liquidateable took ${
-						Date.now() - start
-					}ms to run`
+					} Bot checked ${checkedUsers} users, ${liquidatableUsers} liquidateable, skipReason: ${JSON.stringify(
+						skipReason
+					)}. Took: ${Date.now() - start}ms to run`
 				);
 				this.watchdogTimerLastPatTime = Date.now();
 			}

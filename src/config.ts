@@ -5,7 +5,7 @@ import {
 	loadCommaDelimitToStringArray,
 } from './utils';
 import { OrderExecutionAlgoType } from './types';
-import { DriftEnv } from '@drift-labs/sdk';
+import { BN, DriftEnv } from '@drift-labs/sdk';
 
 export type BaseBotConfig = {
 	botId: string;
@@ -34,14 +34,20 @@ export type FillerMultiThreadedConfig = BaseBotConfig & {
 	marketType: string;
 	marketIndex: number;
 	simulateTxForCUEstimate?: boolean;
+
 	rebalanceFiller?: boolean;
+	rebalanceSettledPnlThreshold?: number;
+	minGasBalanceToFill?: number;
 };
 
 export type FillerConfig = BaseBotConfig & {
 	fillerPollingInterval?: number;
 	revertOnFailure?: boolean;
 	simulateTxForCUEstimate?: boolean;
+
 	rebalanceFiller?: boolean;
+	rebalanceSettledPnlThreshold?: number;
+	minGasBalanceToFill?: number;
 };
 
 export type SubaccountConfig = {
@@ -51,7 +57,9 @@ export type SubaccountConfig = {
 export type LiquidatorConfig = BaseBotConfig & {
 	disableAutoDerisking: boolean;
 	useJupiter: boolean;
+	/// @deprecated, use {@link perpSubAccountConfig} to restrict markets
 	perpMarketIndicies?: Array<number>;
+	/// @deprecated, use {@link spotSubAccountConfig} to restrict markets
 	spotMarketIndicies?: Array<number>;
 	perpSubAccountConfig?: SubaccountConfig;
 	spotSubAccountConfig?: SubaccountConfig;
@@ -69,6 +77,13 @@ export type LiquidatorConfig = BaseBotConfig & {
 	excludedAccounts?: Set<string>;
 	maxPositionTakeoverPctOfCollateral?: number;
 	notifyOnLiquidation?: boolean;
+
+	/// The threshold at which to consider spot asset "dust". Dust will be periodically withdrawn to
+	/// authority wallet to free up spot position slots.
+	/// In human precision: 100.0 for 100.0 USD worth of spot assets
+	spotDustValueThreshold?: number;
+	/// Placeholder, liquidator will set this to the raw BN of {@link LiquidatorConfig.spotDustValueThreshold}
+	spotDustValueThresholdBN?: BN;
 };
 
 export type BotConfigMap = {
@@ -132,6 +147,7 @@ export interface GlobalConfig {
 	jitoMaxBundleTip?: number;
 	jitoMaxBundleFailCount?: number;
 	jitoTipMultiplier?: number;
+	onlySendDuringJitoLeader?: boolean;
 
 	txRetryTimeoutMs?: number;
 	txSenderType?: 'fast' | 'retry' | 'while-valid';
@@ -187,6 +203,7 @@ const defaultConfig: Partial<Config> = {
 		jitoBlockEngineUrl: process.env.JITO_BLOCK_ENGINE_URL,
 		jitoAuthPrivateKey: process.env.JITO_AUTH_PRIVATE_KEY,
 		txRetryTimeoutMs: parseInt(process.env.TX_RETRY_TIMEOUT_MS ?? '30000'),
+		onlySendDuringJitoLeader: false,
 		txSkipPreflight: false,
 		txMaxRetries: 0,
 

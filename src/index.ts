@@ -348,7 +348,8 @@ const runBot = async () => {
 		const skipConfirmation =
 			configHasBot(config, 'fillerLite') ||
 			configHasBot(config, 'filler') ||
-			configHasBot(config, 'spotFiller');
+			configHasBot(config, 'spotFiller') ||
+			configHasBot(config, 'liquidator');
 		txSender = new FastSingleTxSender({
 			connection: sendTxConnection,
 			blockhashRefreshInterval: 500,
@@ -492,9 +493,10 @@ const runBot = async () => {
 			priorityFeeMethod === PriorityFeeMethod.HELIUS
 				? {
 						calculate: (samples: HeliusPriorityFeeResponse) => {
-							return samples.result.priorityFeeLevels![
-								HeliusPriorityLevel.HIGH
-							];
+							return Math.min(
+								50_000,
+								samples.result.priorityFeeLevels![HeliusPriorityLevel.HIGH]
+							);
 						},
 				  }
 				: new AverageOverSlotsStrategy(),

@@ -38,6 +38,7 @@ import {
 	AddressLookupTableAccount,
 	ComputeBudgetProgram,
 	Connection,
+	LAMPORTS_PER_SOL,
 	PublicKey,
 	SendTransactionError,
 	TransactionInstruction,
@@ -84,13 +85,14 @@ import {
 	SimulateAndGetTxWithCUsResponse,
 	sleepMs,
 	swapFillerHardEarnedUSDCForSOL,
+	validMinimumGasAmount,
+	validRebalanceSettledPnlThreshold,
 } from '../utils';
 import { BundleSender } from '../bundleSender';
 import {
 	CACHED_BLOCKHASH_OFFSET,
 	CONFIRM_TX_INTERVAL_MS,
 	CONFIRM_TX_RATE_LIMIT_BACKOFF_MS,
-	MINIMUM_SOL_TO_CONTINUE_FILLING,
 	MakerNodeMap,
 	TX_CONFIRMATION_BATCH_SIZE,
 	TX_TIMEOUT_THRESHOLD_MS,
@@ -249,9 +251,6 @@ export class SpotFillerBot implements Bot {
 
 	private periodicTaskMutex = new Mutex();
 
-	protected hasEnoughSolToFill: boolean = true;
-	protected hasEnoughSolToFillMutex = new Mutex();
-
 	private watchdogTimerMutex = new Mutex();
 	private watchdogTimerLastPatTime = Date.now();
 
@@ -309,6 +308,10 @@ export class SpotFillerBot implements Bot {
 	protected rebalanceFiller?: boolean;
 	protected jupiterClient?: JupiterClient;
 
+	protected hasEnoughSolToFill: boolean = false;
+	protected minGasBalanceToFill: number;
+	protected rebalanceSettledPnlThreshold: BN;
+
 	constructor(
 		driftClient: DriftClient,
 		userMap: UserMap,
@@ -358,20 +361,41 @@ export class SpotFillerBot implements Bot {
 			`${this.name}: revertOnFailure: ${this.revertOnFailure}, simulateTxForCUEstimate: ${this.simulateTxForCUEstimate}`
 		);
 
-		if (
-			config.rebalanceFiller &&
-			this.runtimeSpec.driftEnv === 'mainnet-beta'
-		) {
+		if (this.rebalanceFiller && this.runtimeSpec.driftEnv === 'mainnet-beta') {
 			this.jupiterClient = new JupiterClient({
 				connection: this.driftClient.connection,
 			});
 		}
-		this.rebalanceFiller = config.rebalanceFiller ?? false;
+
 		logger.info(
 			`${this.name}: rebalancing enabled: ${this.jupiterClient !== undefined}`
 		);
 
 		this.userMap = userMap;
+
+		if (!validMinimumGasAmount(config.minGasBalanceToFill)) {
+			this.minGasBalanceToFill = 0.2 * LAMPORTS_PER_SOL;
+		} else {
+			this.minGasBalanceToFill = config.minGasBalanceToFill! * LAMPORTS_PER_SOL;
+		}
+
+		if (
+			!validRebalanceSettledPnlThreshold(config.rebalanceSettledPnlThreshold)
+		) {
+			this.rebalanceSettledPnlThreshold = new BN(20);
+		} else {
+			this.rebalanceSettledPnlThreshold = new BN(
+				config.rebalanceSettledPnlThreshold!
+			);
+		}
+
+		logger.info(
+			`${this.name}: minimumAmountToFill: ${this.minGasBalanceToFill}`
+		);
+
+		logger.info(
+			`${this.name}: minimumAmountToSettle: ${this.rebalanceSettledPnlThreshold}`
+		);
 
 		if (this.driftClient.userAccountSubscriptionConfig.type === 'websocket') {
 			this.orderSubscriber = new OrderSubscriber({
@@ -577,6 +601,14 @@ export class SpotFillerBot implements Bot {
 
 	public async init() {
 		logger.info(`${this.name} initing`);
+
+		const fillerSolBalance = await this.driftClient.connection.getBalance(
+			this.driftClient.authority
+		);
+		this.hasEnoughSolToFill = fillerSolBalance >= this.minGasBalanceToFill;
+		logger.info(
+			`${this.name}: hasEnoughSolToFill: ${this.hasEnoughSolToFill}, balance: ${fillerSolBalance}`
+		);
 
 		const orderSubscriberInitStart = Date.now();
 		logger.info(`Initializing OrderSubscriber...`);
@@ -1597,6 +1629,20 @@ export class SpotFillerBot implements Bot {
 		return this.bundleSender?.slotsUntilNextLeader();
 	}
 
+	private shouldBuildForBundle(): boolean {
+		if (!this.usingJito()) {
+			return false;
+		}
+		if (this.globalConfig.onlySendDuringJitoLeader === true) {
+			const slotsUntilJito = this.slotsUntilJitoLeader();
+			if (slotsUntilJito === undefined) {
+				return false;
+			}
+			return slotsUntilJito < SLOTS_UNTIL_JITO_LEADER_TO_SEND;
+		}
+		return true;
+	}
+
 	private async getBlockhashForTx(): Promise<string> {
 		const cachedBlockhash = this.blockhashSubscriber.getLatestBlockhash(
 			CACHED_BLOCKHASH_OFFSET
@@ -1882,28 +1928,23 @@ export class SpotFillerBot implements Bot {
 				}
 			} else {
 				if (!this.dryRun) {
-					const release = await this.hasEnoughSolToFillMutex.acquire();
-					try {
-						if (this.hasEnoughSolToFill) {
-							const lutAccounts: Array<AddressLookupTableAccount> = [];
-							this.driftLutAccount && lutAccounts.push(this.driftLutAccount);
-							this.driftSpotLutAccount &&
-								lutAccounts.push(this.driftSpotLutAccount);
+					if (this.hasEnoughSolToFill) {
+						const lutAccounts: Array<AddressLookupTableAccount> = [];
+						this.driftLutAccount && lutAccounts.push(this.driftLutAccount);
+						this.driftSpotLutAccount &&
+							lutAccounts.push(this.driftSpotLutAccount);
 
-							this.sendFillTxAndParseLogs(
-								fillTxId,
-								nodeToFill,
-								simResult.tx,
-								buildForBundle,
-								lutAccounts
-							);
-						} else {
-							logger.info(
-								`not sending tx because we don't have enough SOL to fill (fillTxId: ${fillTxId})`
-							);
-						}
-					} finally {
-						release();
+						this.sendFillTxAndParseLogs(
+							fillTxId,
+							nodeToFill,
+							simResult.tx,
+							buildForBundle,
+							lutAccounts
+						);
+					} else {
+						logger.info(
+							`not sending tx because we don't have enough SOL to fill (fillTxId: ${fillTxId})`
+						);
 					}
 				} else {
 					logger.info(`dry run, not sending tx (fillTxId: ${fillTxId})`);
@@ -2114,23 +2155,18 @@ export class SpotFillerBot implements Bot {
 			if (this.dryRun) {
 				logger.info(`dry run, not filling spot order (fillTxId: ${fillTxId})`);
 			} else {
-				const release = await this.hasEnoughSolToFillMutex.acquire();
-				try {
-					if (this.hasEnoughSolToFill) {
-						this.sendFillTxAndParseLogs(
-							fillTxId,
-							nodeToFill,
-							simResult.tx,
-							buildForBundle,
-							lutAccounts
-						);
-					} else {
-						logger.info(
-							`not sending tx because we don't have enough SOL to fill (fillTxId: ${fillTxId})`
-						);
-					}
-				} finally {
-					release();
+				if (this.hasEnoughSolToFill) {
+					this.sendFillTxAndParseLogs(
+						fillTxId,
+						nodeToFill,
+						simResult.tx,
+						buildForBundle,
+						lutAccounts
+					);
+				} else {
+					logger.info(
+						`not sending tx because we don't have enough SOL to fill (fillTxId: ${fillTxId})`
+					);
 				}
 			}
 		}
@@ -2241,79 +2277,70 @@ export class SpotFillerBot implements Bot {
 				);
 			} else {
 				if (!this.dryRun) {
-					const release = await this.hasEnoughSolToFillMutex.acquire();
-					try {
-						if (this.hasEnoughSolToFill) {
-							// @ts-ignore;
-							simResult.tx.sign([this.driftClient.wallet.payer]);
-							const txSig = bs58.encode(simResult.tx.signatures[0]);
-							this.registerTxSigToConfirm(
-								txSig,
-								Date.now(),
-								undefined,
-								-1,
-								'trigger'
-							);
+					if (this.hasEnoughSolToFill) {
+						// @ts-ignore;
+						simResult.tx.sign([this.driftClient.wallet.payer]);
+						const txSig = bs58.encode(simResult.tx.signatures[0]);
+						this.registerTxSigToConfirm(
+							txSig,
+							Date.now(),
+							undefined,
+							-1,
+							'trigger'
+						);
 
-							if (buildForBundle) {
-								await this.sendTxThroughJito(
-									simResult.tx,
-									'triggerOrder',
-									txSig
-								);
-								this.removeTriggeringNodes(nodeToTrigger);
-							} else if (this.canSendOutsideJito()) {
-								this.driftClient
-									.sendTransaction(simResult.tx)
-									.then((txSig) => {
-										logger.info(
-											`Triggered user (account: ${nodeToTrigger.node.userAccount.toString()}, userSlot: ${
-												user.slot
-											}) order: ${nodeToTrigger.node.order.orderId.toString()}`
+						if (buildForBundle) {
+							await this.sendTxThroughJito(simResult.tx, 'triggerOrder', txSig);
+							this.removeTriggeringNodes(nodeToTrigger);
+						} else if (this.canSendOutsideJito()) {
+							this.driftClient
+								.sendTransaction(simResult.tx)
+								.then((txSig) => {
+									logger.info(
+										`Triggered user (account: ${nodeToTrigger.node.userAccount.toString()}, userSlot: ${
+											user.slot
+										}) order: ${nodeToTrigger.node.order.orderId.toString()}`
+									);
+									logger.info(`Tx: ${txSig}`);
+								})
+								.catch((error) => {
+									nodeToTrigger.node.haveTrigger = false;
+
+									const errorCode = getErrorCode(error);
+									if (
+										errorCode &&
+										!errorCodesToSuppress.includes(errorCode) &&
+										!(error as Error).message.includes(
+											'Transaction was not confirmed'
+										)
+									) {
+										const user = this.driftClient.getUser();
+										this.txSimErrorCounter?.add(1, {
+											errorCode: errorCode.toString(),
+											...metricAttrFromUserAccount(
+												user.userAccountPublicKey,
+												user.getUserAccount()
+											),
+										});
+										logger.error(
+											`Error(${errorCode}) triggering order for user(account: ${nodeToTrigger.node.userAccount.toString()}) order: ${nodeToTrigger.node.order.orderId.toString()} `
 										);
-										logger.info(`Tx: ${txSig}`);
-									})
-									.catch((error) => {
-										nodeToTrigger.node.haveTrigger = false;
-
-										const errorCode = getErrorCode(error);
-										if (
-											errorCode &&
-											!errorCodesToSuppress.includes(errorCode) &&
-											!(error as Error).message.includes(
-												'Transaction was not confirmed'
-											)
-										) {
-											const user = this.driftClient.getUser();
-											this.txSimErrorCounter?.add(1, {
-												errorCode: errorCode.toString(),
-												...metricAttrFromUserAccount(
-													user.userAccountPublicKey,
-													user.getUserAccount()
-												),
-											});
-											logger.error(
-												`Error(${errorCode}) triggering order for user(account: ${nodeToTrigger.node.userAccount.toString()}) order: ${nodeToTrigger.node.order.orderId.toString()} `
-											);
-											logger.error(error);
-											webhookMessage(
-												`[${
-													this.name
-												}]: Error(${errorCode}) triggering order for user(account: ${nodeToTrigger.node.userAccount.toString()}) order: ${nodeToTrigger.node.order.orderId.toString()} \n${
-													error.stack ? error.stack : error.message
-												} `
-											);
-										}
-									})
-									.finally(() => {
-										this.removeTriggeringNodes(nodeToTrigger);
-									});
-							}
-						} else {
-							logger.info(`Not enough SOL to fill, not triggering node`);
+										logger.error(error);
+										webhookMessage(
+											`[${
+												this.name
+											}]: Error(${errorCode}) triggering order for user(account: ${nodeToTrigger.node.userAccount.toString()}) order: ${nodeToTrigger.node.order.orderId.toString()} \n${
+												error.stack ? error.stack : error.message
+											} `
+										);
+									}
+								})
+								.finally(() => {
+									this.removeTriggeringNodes(nodeToTrigger);
+								});
 						}
-					} finally {
-						release();
+					} else {
+						logger.info(`Not enough SOL to fill, not triggering node`);
 					}
 				} else {
 					logger.info(`dry run, not triggering node`);
@@ -2337,17 +2364,12 @@ export class SpotFillerBot implements Bot {
 
 		try {
 			// Check hasEnoughSolToFill before trying to fill, we do not want to fill if we don't have enough SOL
-			const release = await this.hasEnoughSolToFillMutex.acquire();
-			try {
-				if (!this.hasEnoughSolToFill) {
-					logger.info(`Not enough SOL to fill, skipping fill`);
-					await this.watchdogTimerMutex.runExclusive(async () => {
-						this.watchdogTimerLastPatTime = Date.now();
-					});
-					return;
-				}
-			} finally {
-				release();
+			if (!this.hasEnoughSolToFill) {
+				logger.info(`Not enough SOL to fill, skipping periodic action`);
+				await this.watchdogTimerMutex.runExclusive(async () => {
+					this.watchdogTimerLastPatTime = Date.now();
+				});
+				return;
 			}
 
 			await tryAcquire(this.periodicTaskMutex).runExclusive(async () => {
@@ -2388,11 +2410,7 @@ export class SpotFillerBot implements Bot {
 					`filtered triggerable nodes from ${triggerableNodes.length} to ${filteredTriggerableNodes.length} `
 				);
 
-				const slotsUntilJito = this.slotsUntilJitoLeader();
-				const buildForBundle =
-					this.usingJito() &&
-					slotsUntilJito !== undefined &&
-					slotsUntilJito < SLOTS_UNTIL_JITO_LEADER_TO_SEND;
+				const buildForBundle = this.shouldBuildForBundle();
 
 				await Promise.all([
 					this.executeFillableSpotNodesForMarket(fillableNodes, buildForBundle),
@@ -2452,32 +2470,43 @@ export class SpotFillerBot implements Bot {
 		const fillerSolBalance = await this.driftClient.connection.getBalance(
 			this.driftClient.authority
 		);
+		this.hasEnoughSolToFill = fillerSolBalance >= this.minGasBalanceToFill;
 
-		const release = await this.hasEnoughSolToFillMutex.acquire();
-		try {
-			this.hasEnoughSolToFill =
-				fillerSolBalance >= MINIMUM_SOL_TO_CONTINUE_FILLING;
+		const fillerDriftAccountUsdcBalance = this.driftClient.getTokenAmount(0);
+		const usdcSpotMarket = this.driftClient.getSpotMarketAccount(0);
+		const normalizedFillerDriftAccountUsdcBalance =
+			fillerDriftAccountUsdcBalance.divn(10 ** usdcSpotMarket!.decimals);
+		const isUsdcAmountRebalanceable =
+			normalizedFillerDriftAccountUsdcBalance.gte(
+				this.rebalanceSettledPnlThreshold
+			) || !this.hasEnoughSolToFill;
 
-			if (!this.hasEnoughSolToFill && this.jupiterClient !== undefined) {
+		logger.info(
+			`SpotFiller has ${normalizedFillerDriftAccountUsdcBalance.toNumber()} USDC`
+		);
+
+		if (isUsdcAmountRebalanceable) {
+			if (this.jupiterClient !== undefined) {
 				logger.info(`Swapping USDC for SOL to rebalance filler`);
-				await swapFillerHardEarnedUSDCForSOL(
+				swapFillerHardEarnedUSDCForSOL(
 					this.priorityFeeSubscriber,
 					this.driftClient,
 					this.jupiterClient,
 					await this.getBlockhashForTx()
-				);
-				const fillerSolBalanceAfterSwap =
-					await this.driftClient.connection.getBalance(
-						this.driftClient.authority,
-						'processed'
-					);
-				this.hasEnoughSolToFill =
-					fillerSolBalanceAfterSwap >= MINIMUM_SOL_TO_CONTINUE_FILLING;
+				).then(async () => {
+					const fillerSolBalanceAfterSwap =
+						await this.driftClient.connection.getBalance(
+							this.driftClient.authority,
+							'processed'
+						);
+					this.hasEnoughSolToFill =
+						fillerSolBalanceAfterSwap >= this.minGasBalanceToFill;
+				});
 			} else {
-				this.hasEnoughSolToFill = true;
+				throw new Error(
+					'Jupiter client not initialized but trying to rebalance'
+				);
 			}
-		} finally {
-			release();
 		}
 	}
 }
